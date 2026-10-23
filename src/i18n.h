@@ -681,3 +681,4 @@ static inline AppLangId ParseLangCode(const wchar_t* code) {
     }
     return DetectSystemDefaultLang();
 }
+

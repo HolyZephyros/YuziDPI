@@ -36,3 +36,4 @@ MinGW-w64 (`g++` ve `windres`) ile tek komutla derlenir:
 ```bat
 build.bat
 ```
+

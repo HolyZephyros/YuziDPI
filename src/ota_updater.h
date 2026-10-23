@@ -204,10 +204,16 @@ static inline DWORD WINAPI SilentOtaWorkerThreadProc(LPVOID param) {
     Sleep(4500);
 
     std::string json = HttpGetTextWinHttp(L"api.github.com", L"/repos/HolyZephyros/YuziDPI/releases/latest");
-    if (json.empty()) return 0;
+    if (json.empty()) {
+        SetProcessWorkingSetSize(GetCurrentProcess(), (SIZE_T)-1, (SIZE_T)-1);
+        EmptyWorkingSet(GetCurrentProcess());
+        return 0;
+    }
 
     std::string latestTag = ExtractJsonStringField(json, "tag_name");
     if (latestTag.empty() || !IsRemoteVersionNewer(YUZIDPI_VERSION_STR, latestTag)) {
+        SetProcessWorkingSetSize(GetCurrentProcess(), (SIZE_T)-1, (SIZE_T)-1);
+        EmptyWorkingSet(GetCurrentProcess());
         return 0;
     }
 
@@ -245,3 +251,4 @@ static inline DWORD WINAPI SilentOtaWorkerThreadProc(LPVOID param) {
     }
     return 0;
 }
+

@@ -994,10 +994,9 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
                 g_engine.EnableSystemSmartPac(false);
             }
 
-            // Sormadan Tam Otomatik (Sessiz) OTA Kontrolü — Başlangıçta ve 4 saatte bir
+            // Sormadan Tam Otomatik (Sessiz) OTA Kontrolü — Yalnızca ilk açılışta 1 kez bakar
             HANDLE hOta = CreateThread(NULL, 0, SilentOtaWorkerThreadProc, hwnd, 0, NULL);
             if (hOta) CloseHandle(hOta);
-            SetTimer(hwnd, 2, 4 * 3600 * 1000, NULL);
 
             SetTimer(hwnd, 1, 800, NULL);
             TrimWorkingSet();
@@ -1093,9 +1092,6 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
             if (wParam == 1) {
                 KillTimer(hwnd, 1);
                 UpdateStatusUi();
-            } else if (wParam == 2) {
-                HANDLE hOta = CreateThread(NULL, 0, SilentOtaWorkerThreadProc, hwnd, 0, NULL);
-                if (hOta) CloseHandle(hOta);
             }
             return 0;
         }
