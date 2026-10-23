@@ -2,7 +2,7 @@
 
 **YuziDPI**, Windows için geliştirilmiş, sürücü (WinDivert vb. çekirdek sürücüsü) gerektirmeyen, tek dosya (`.exe`), ultra hafif (**~1.2 MB RAM**) **Akıllı DPI Bypass & Uygulama/Alan Adı Tüneli** aracıdır.
 
-> **[⬇ Son Sürümü İndir (YuziDPI.exe — v1.0.0)](https://github.com/HolyZephyros/YuziDPI/releases/latest/download/YuziDPI.exe)**
+> **[⬇ Son Sürümü İndir (YuziDPI.exe — v1.0.1)](https://github.com/HolyZephyros/YuziDPI/releases/latest/download/YuziDPI.exe)**
 
 ---
 

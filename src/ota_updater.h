@@ -5,8 +5,8 @@
 #include <vector>
 #include <cstdio>
 
-#define YUZIDPI_VERSION_STR  "1.0.0"
-#define YUZIDPI_VERSION_WSTR L"v1.0.0"
+#define YUZIDPI_VERSION_STR  "1.0.1"
+#define YUZIDPI_VERSION_WSTR L"v1.0.1"
 #define WM_OTA_RESTART       (WM_USER + 150)
 
 static inline std::wstring GetCurrentExeFullPath() {

@@ -1301,6 +1301,20 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, LPWSTR lpCmdLine, int) {
         return (st >= STAGE_1_FAST_TLS_REC && st <= STAGE_6_UPSTREAM_TUNNEL && lat > 0) ? 0 : 1;
     }
 
+    // Eğer az önce OTA güncellemesiyle yeniden başlatıldıysa (.old dosyası varsa),
+    // eski sürecin penceresini kapatmasını bekle ki tek-örnek (FindWindow) kontrolüne takılmasın
+    {
+        std::wstring oldFile = GetCurrentExeFullPath() + L".old";
+        if (GetFileAttributesW(oldFile.c_str()) != INVALID_FILE_ATTRIBUTES) {
+            for (int i = 0; i < 40; ++i) {
+                if (!FindWindowW(L"YuziDpiDarkLiquidGlassWnd", NULL)) break;
+                Sleep(50);
+            }
+            Sleep(100);
+            DeleteFileW(oldFile.c_str());
+        }
+    }
+
     HWND hExisting = FindWindowW(L"YuziDpiDarkLiquidGlassWnd", NULL);
     if (hExisting) {
         if (!lpCmdLine || wcsstr(lpCmdLine, L"--minimized") == nullptr) {
