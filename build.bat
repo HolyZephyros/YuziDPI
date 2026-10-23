@@ -17,7 +17,7 @@ echo [*] YuziDPI Kaynak ve Logo Ikonu Derleniyor...
 windres src\app.rc -O coff -o src\app_res.o
 
 echo [*] YuziDPI Native Win32 C++ Derleniyor...
-g++ -std=c++17 -O2 -s -static -mwindows -municode ^
+g++ -std=c++17 -O2 -static -mwindows -municode ^
     src\main.cpp src\dpi_engine.cpp src\app_res.o ^
     -o YuziDPI.exe ^
     -lws2_32 -liphlpapi -lwinhttp -lwininet -ldwmapi -lgdiplus -lgdi32 -luser32 -lshell32 -lpsapi -ladvapi32 -lcomctl32 -lcomdlg32 -lole32 -luuid

@@ -20,7 +20,7 @@ jobs:
         shell: cmd
         run: |
           windres src\app.rc -O coff -o src\app_res.o
-          g++ -O2 -std=c++17 -municode -mwindows src\main.cpp src\app_res.o -o YuziDPI.exe -lws2_32 -liphlpapi -lwininet -lwinhttp -lcomctl32 -lgdi32 -lole32 -luuid -lshell32 -lshlwapi -ladvapi32 -ldwmapi -luxtheme -lgdiplus -lpsapi -static -static-libgcc -static-libstdc++ -s
+          g++ -std=c++17 -O2 -static -mwindows -municode src\main.cpp src\dpi_engine.cpp src\app_res.o -o YuziDPI.exe -lws2_32 -liphlpapi -lwinhttp -lwininet -ldwmapi -lgdiplus -lgdi32 -luser32 -lshell32 -lpsapi -ladvapi32 -lcomctl32 -lcomdlg32 -lole32 -luuid
 
       - name: Publish GitHub Release
         if: startsWith(github.ref, 'refs/tags/v')
