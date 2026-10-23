@@ -126,6 +126,16 @@ static bool g_hoverRowDel   = false;
 static ZeroDpiEngine g_engine;
 static NOTIFYICONDATAW g_nid{};
 static std::wstring g_iniPath;
+static UINT g_uMsgTaskbarCreated = 0;
+
+static LONG WINAPI YuziCrashSafeFilter(EXCEPTION_POINTERS*) {
+    g_engine.EnableSystemSmartPac(false);
+    if (g_nid.hWnd) {
+        Shell_NotifyIconW(NIM_DELETE, &g_nid);
+        g_nid.hWnd = NULL;
+    }
+    return EXCEPTION_EXECUTE_HANDLER;
+}
 
 static const UiStrings& L() {
     return g_locales[(int)g_lang];
@@ -1098,12 +1108,14 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
 
         case WM_OTA_RESTART: {
             bool wasHidden = !IsWindowVisible(hwnd);
+            g_engine.SetCallbacks(nullptr, nullptr);
             g_engine.Stop();
             g_engine.EnableSystemSmartPac(false);
             if (g_nid.hWnd) {
                 Shell_NotifyIconW(NIM_DELETE, &g_nid);
                 g_nid.hWnd = NULL;
             }
+            ShowWindow(hwnd, SW_HIDE);
             std::wstring exePath = GetCurrentExeFullPath();
             wchar_t cmdLine[MAX_PATH + 32] = {0};
             if (wasHidden) {
@@ -1275,25 +1287,40 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
 
         case WM_QUERYENDSESSION:
         case WM_ENDSESSION:
-            g_engine.Stop();
-            g_engine.EnableSystemSmartPac(false);
-            if (g_nid.hWnd) Shell_NotifyIconW(NIM_DELETE, &g_nid);
-            return TRUE;
-
-        case WM_DESTROY:
+            g_engine.SetCallbacks(nullptr, nullptr);
             g_engine.Stop();
             g_engine.EnableSystemSmartPac(false);
             if (g_nid.hWnd) {
                 Shell_NotifyIconW(NIM_DELETE, &g_nid);
+                g_nid.hWnd = NULL;
+            }
+            return TRUE;
+
+        case WM_DESTROY:
+            g_hMainWnd = NULL;
+            g_engine.SetCallbacks(nullptr, nullptr);
+            g_engine.Stop();
+            g_engine.EnableSystemSmartPac(false);
+            if (g_nid.hWnd) {
+                Shell_NotifyIconW(NIM_DELETE, &g_nid);
+                g_nid.hWnd = NULL;
             }
             CoUninitialize();
             PostQuitMessage(0);
             return 0;
     }
+    if (g_uMsgTaskbarCreated != 0 && msg == g_uMsgTaskbarCreated) {
+        g_nid.hWnd = NULL;
+        SetupTrayIcon(hwnd);
+        return 0;
+    }
     return DefWindowProcW(hwnd, msg, wParam, lParam);
 }
 
 int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, LPWSTR lpCmdLine, int) {
+    SetErrorMode(SEM_FAILCRITICALERRORS | SEM_NOGPFAULTERRORBOX);
+    SetUnhandledExceptionFilter(YuziCrashSafeFilter);
+    g_uMsgTaskbarCreated = RegisterWindowMessageW(L"TaskbarCreated");
     if (lpCmdLine && wcsstr(lpCmdLine, L"--verify-test") != nullptr) {
         int lat = 0;
         BypassStage st = g_engine.RunAutoDiscovery(lat);

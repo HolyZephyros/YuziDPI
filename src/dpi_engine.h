@@ -161,6 +161,7 @@ private:
     std::atomic<int>  m_activeStage{STAGE_1_FAST_TLS_REC};
     std::atomic<int>  m_probeStage{STAGE_1_FAST_TLS_REC};
     std::atomic<int>  m_lastLatencyMs{0};
+    std::atomic<int>  m_activeWorkers{0};
 
     uint16_t m_httpPort{3131};
     uint16_t m_socksPort{1080};

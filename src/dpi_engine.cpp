@@ -54,14 +54,14 @@ static bool NormalizeHttpProxyRequest(const char* buf, int len, std::string& out
 
 static DWORD WINAPI RelayHalfThread(LPVOID param) {
     RelayHalfCtx* ctx = (RelayHalfCtx*)param;
-    char buf[16384];
+    std::vector<char> buf(16384);
     std::string rewritten;
     while (true) {
-        int r = recv(ctx->src, buf, sizeof(buf), 0);
+        int r = recv(ctx->src, buf.data(), (int)buf.size(), 0);
         if (r <= 0) break;
-        const char* sendPtr = buf;
+        const char* sendPtr = buf.data();
         int sendLen = r;
-        if (NormalizeHttpProxyRequest(buf, r, rewritten)) {
+        if (NormalizeHttpProxyRequest(buf.data(), r, rewritten)) {
             sendPtr = rewritten.data();
             sendLen = (int)rewritten.size();
         }
@@ -73,8 +73,8 @@ static DWORD WINAPI RelayHalfThread(LPVOID param) {
         }
         if (sent < sendLen) break;
     }
-    shutdown(ctx->dst, SD_SEND);
-    shutdown(ctx->src, SD_RECEIVE);
+    shutdown(ctx->dst, SD_BOTH);
+    shutdown(ctx->src, SD_BOTH);
     delete ctx;
     return 0;
 }
@@ -355,8 +355,14 @@ static bool GetSocketOwnerProcess(SOCKET clientSock, std::wstring& outFullPath, 
     GetExtendedTcpTable(nullptr, &dwSize, FALSE, AF_INET, TCP_TABLE_OWNER_PID_CONNECTIONS, 0);
     if (dwSize == 0) return false;
 
-    std::vector<uint8_t> buffer(dwSize);
-    if (GetExtendedTcpTable(buffer.data(), &dwSize, FALSE, AF_INET, TCP_TABLE_OWNER_PID_CONNECTIONS, 0) != NO_ERROR) {
+    std::vector<uint8_t> buffer;
+    DWORD ret = ERROR_INSUFFICIENT_BUFFER;
+    for (int attempt = 0; attempt < 3 && ret == ERROR_INSUFFICIENT_BUFFER; ++attempt) {
+        dwSize += 4096;
+        buffer.resize(dwSize);
+        ret = GetExtendedTcpTable(buffer.data(), &dwSize, FALSE, AF_INET, TCP_TABLE_OWNER_PID_CONNECTIONS, 0);
+    }
+    if (ret != NO_ERROR) {
         return false;
     }
 
@@ -716,6 +722,9 @@ std::string ZeroDpiEngine::ResolveDoH(const std::string& host, BypassStage stage
 
     if (!resolvedIp.empty()) {
         std::lock_guard<std::mutex> lock(m_mutex);
+        if (m_dohCache.size() >= 512) {
+            m_dohCache.clear();
+        }
         m_dohCache[lowerHost] = resolvedIp;
     }
     return resolvedIp;
@@ -1196,17 +1205,20 @@ int ZeroDpiEngine::RelaySockets(SOCKET s1, SOCKET s2) {
     RegisterRelaySocket(s2);
 
     RelayHalfCtx* c1 = new RelayHalfCtx{ s1, s2 };
-    HANDLE hThread = CreateThread(nullptr, 0, RelayHalfThread, c1, 0, nullptr);
+    HANDLE hThread = CreateThread(nullptr, 128 * 1024, RelayHalfThread, c1, STACK_SIZE_PARAM_IS_A_RESERVATION, nullptr);
+    if (!hThread) {
+        delete c1;
+    }
 
     int totalFromServer = 0;
-    char buf[16384];
+    std::vector<char> buf(16384);
     while (m_running.load()) {
-        int r = recv(s2, buf, sizeof(buf), 0);
+        int r = recv(s2, buf.data(), (int)buf.size(), 0);
         if (r <= 0) break;
         totalFromServer += r;
         int sent = 0;
         while (sent < r) {
-            int w = send(s1, buf + sent, r - sent, 0);
+            int w = send(s1, buf.data() + sent, r - sent, 0);
             if (w <= 0) break;
             sent += w;
         }
@@ -1216,12 +1228,20 @@ int ZeroDpiEngine::RelaySockets(SOCKET s1, SOCKET s2) {
     UnregisterRelaySocket(s1);
     UnregisterRelaySocket(s2);
 
-    shutdown(s1, SD_SEND);
-    shutdown(s2, SD_RECEIVE);
+    shutdown(s1, SD_BOTH);
+    shutdown(s2, SD_BOTH);
     if (hThread) {
-        WaitForSingleObject(hThread, 3000);
+        if (WaitForSingleObject(hThread, 1500) == WAIT_TIMEOUT) {
+            closesocket(s1);
+            closesocket(s2);
+            s1 = INVALID_SOCKET;
+            s2 = INVALID_SOCKET;
+            WaitForSingleObject(hThread, 2000);
+        }
         CloseHandle(hThread);
     }
+    if (s2 != INVALID_SOCKET) closesocket(s2);
+    if (s1 != INVALID_SOCKET) closesocket(s1);
     return totalFromServer;
 }
 
@@ -1311,8 +1331,6 @@ void ZeroDpiEngine::HandleHttpClient(SOCKET clientSock) {
         setsockopt(remoteSock, SOL_SOCKET, SO_RCVTIMEO, (const char*)&relayTimeout, sizeof(relayTimeout));
 
         RelaySockets(clientSock, remoteSock);
-        closesocket(remoteSock);
-        closesocket(clientSock);
         return;
     }
 
@@ -1340,7 +1358,7 @@ void ZeroDpiEngine::HandleHttpClient(SOCKET clientSock) {
                     SendAllExact(remoteSock, (const uint8_t*)reqBuf, n);
                 }
                 RelaySockets(clientSock, remoteSock);
-                closesocket(remoteSock);
+                return;
             }
         }
     }
@@ -1356,7 +1374,12 @@ void ZeroDpiEngine::HandleSocks5Client(SOCKET clientSock) {
     int n = recv(clientSock, (char*)buf, 2, 0);
     if (n < 2 || buf[0] != 0x05) { closesocket(clientSock); return; }
     int nmethods = buf[1];
-    if (nmethods > 0) recv(clientSock, (char*)buf, nmethods, 0);
+    int readMethods = 0;
+    while (readMethods < nmethods) {
+        int r = recv(clientSock, (char*)buf + readMethods, nmethods - readMethods, 0);
+        if (r <= 0) { closesocket(clientSock); return; }
+        readMethods += r;
+    }
 
     uint8_t authResp[2] = { 0x05, 0x00 };
     send(clientSock, (const char*)authResp, 2, 0);
@@ -1381,6 +1404,8 @@ void ZeroDpiEngine::HandleSocks5Client(SOCKET clientSock) {
         if (recv(clientSock, dname.data(), dlen, 0) != dlen) { closesocket(clientSock); return; }
         host = dname.data();
     } else {
+        uint8_t errReply[10] = { 0x05, 0x08, 0x00, 0x01, 0,0,0,0, 0,0 };
+        send(clientSock, (const char*)errReply, 10, 0);
         closesocket(clientSock);
         return;
     }
@@ -1434,15 +1459,15 @@ void ZeroDpiEngine::HandleSocks5Client(SOCKET clientSock) {
     setsockopt(remoteSock, SOL_SOCKET, SO_RCVTIMEO, (const char*)&relayTimeout, sizeof(relayTimeout));
 
     RelaySockets(clientSock, remoteSock);
-    closesocket(remoteSock);
-    closesocket(clientSock);
 }
 
 DWORD WINAPI ZeroDpiEngine::ClientWorkerThreadProc(LPVOID param) {
     ClientWorkerCtx* ctx = (ClientWorkerCtx*)param;
-    if (ctx->isSocks5) ctx->engine->HandleSocks5Client(ctx->sock);
-    else ctx->engine->HandleHttpClient(ctx->sock);
+    ZeroDpiEngine* self = ctx->engine;
+    if (ctx->isSocks5) self->HandleSocks5Client(ctx->sock);
+    else self->HandleHttpClient(ctx->sock);
     delete ctx;
+    self->m_activeWorkers.fetch_sub(1);
     return 0;
 }
 
@@ -1470,10 +1495,16 @@ DWORD WINAPI ZeroDpiEngine::HttpAcceptThreadProc(LPVOID param) {
     while (self->m_running.load()) {
         SOCKET client = accept(self->m_httpListenSock, nullptr, nullptr);
         if (client == INVALID_SOCKET) break;
+        if (!self->m_running.load()) { closesocket(client); break; }
+        self->m_activeWorkers.fetch_add(1);
         ClientWorkerCtx* ctx = new ClientWorkerCtx{ self, client, false };
-        HANDLE h = CreateThread(nullptr, 0, ClientWorkerThreadProc, ctx, 0, nullptr);
+        HANDLE h = CreateThread(nullptr, 128 * 1024, ClientWorkerThreadProc, ctx, STACK_SIZE_PARAM_IS_A_RESERVATION, nullptr);
         if (h) CloseHandle(h);
-        else { closesocket(client); delete ctx; }
+        else {
+            self->m_activeWorkers.fetch_sub(1);
+            closesocket(client);
+            delete ctx;
+        }
     }
     return 0;
 }
@@ -1483,10 +1514,16 @@ DWORD WINAPI ZeroDpiEngine::SocksAcceptThreadProc(LPVOID param) {
     while (self->m_running.load()) {
         SOCKET client = accept(self->m_socksListenSock, nullptr, nullptr);
         if (client == INVALID_SOCKET) break;
+        if (!self->m_running.load()) { closesocket(client); break; }
+        self->m_activeWorkers.fetch_add(1);
         ClientWorkerCtx* ctx = new ClientWorkerCtx{ self, client, true };
-        HANDLE h = CreateThread(nullptr, 0, ClientWorkerThreadProc, ctx, 0, nullptr);
+        HANDLE h = CreateThread(nullptr, 128 * 1024, ClientWorkerThreadProc, ctx, STACK_SIZE_PARAM_IS_A_RESERVATION, nullptr);
         if (h) CloseHandle(h);
-        else { closesocket(client); delete ctx; }
+        else {
+            self->m_activeWorkers.fetch_sub(1);
+            closesocket(client);
+            delete ctx;
+        }
     }
     return 0;
 }
@@ -1584,17 +1621,29 @@ static void RescueStuckStartupDiscord(uint16_t httpPort) {
 
 DWORD WINAPI ZeroDpiEngine::StartupWorkerThreadProc(LPVOID param) {
     ZeroDpiEngine* self = (ZeroDpiEngine*)param;
+    if (!self->m_running.load()) {
+        self->m_activeWorkers.fetch_sub(1);
+        return 0;
+    }
     self->EnableSystemSmartPac(true);
     // Windows açılışında Discord, YuziDPI'dan birkaç salise önce başlayıp ProxyEnable=0
     // önbelleklemişse (Checking for updates / 10054 döngüsünde takılı kaldıysa) otomatik kurtar:
-    RescueStuckStartupDiscord(self->m_httpPort);
+    if (self->m_running.load()) {
+        RescueStuckStartupDiscord(self->m_httpPort);
+    }
     int lat = 0;
-    BypassStage st = self->RunAutoDiscovery(lat);
+    BypassStage st = (BypassStage)self->m_selectedMode.load();
+    if (self->m_running.load()) {
+        st = self->RunAutoDiscovery(lat);
+    } else {
+        self->EnableSystemSmartPac(false);
+    }
     SetProcessWorkingSetSize(GetCurrentProcess(), (SIZE_T)-1, (SIZE_T)-1);
     EmptyWorkingSet(GetCurrentProcess());
     if (self->m_stateCb) {
         self->m_stateCb(st, self->m_running.load(), lat);
     }
+    self->m_activeWorkers.fetch_sub(1);
     return 0;
 }
 
@@ -1618,13 +1667,15 @@ bool ZeroDpiEngine::Start(uint16_t httpPort, uint16_t socksPort) {
 
     m_running.store(true);
     EnableSystemSmartPac(true);
-    m_httpThread = CreateThread(nullptr, 0, HttpAcceptThreadProc, this, 0, nullptr);
-    m_socksThread = CreateThread(nullptr, 0, SocksAcceptThreadProc, this, 0, nullptr);
+    m_httpThread = CreateThread(nullptr, 128 * 1024, HttpAcceptThreadProc, this, STACK_SIZE_PARAM_IS_A_RESERVATION, nullptr);
+    m_socksThread = CreateThread(nullptr, 128 * 1024, SocksAcceptThreadProc, this, STACK_SIZE_PARAM_IS_A_RESERVATION, nullptr);
 
     Log(L"[+] Tünel Aktif (127.0.0.1:%u / SOCKS5:%u)", m_httpPort, m_socksPort);
 
-    HANDLE hDisc = CreateThread(nullptr, 0, StartupWorkerThreadProc, this, 0, nullptr);
+    m_activeWorkers.fetch_add(1);
+    HANDLE hDisc = CreateThread(nullptr, 128 * 1024, StartupWorkerThreadProc, this, STACK_SIZE_PARAM_IS_A_RESERVATION, nullptr);
     if (hDisc) CloseHandle(hDisc);
+    else m_activeWorkers.fetch_sub(1);
 
     return true;
 }
@@ -1643,6 +1694,15 @@ void ZeroDpiEngine::Stop() {
         m_socksListenSock = INVALID_SOCKET;
     }
 
+    {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        for (SOCKET s : m_activeRelaySocks) {
+            if (s != INVALID_SOCKET) {
+                shutdown(s, SD_BOTH);
+            }
+        }
+    }
+
     if (m_httpThread) {
         WaitForSingleObject(m_httpThread, 1200);
         CloseHandle(m_httpThread);
@@ -1652,6 +1712,10 @@ void ZeroDpiEngine::Stop() {
         WaitForSingleObject(m_socksThread, 1200);
         CloseHandle(m_socksThread);
         m_socksThread = NULL;
+    }
+
+    for (int i = 0; i < 30 && m_activeWorkers.load() > 0; ++i) {
+        Sleep(25);
     }
 
     Log(L"[■] Servis durduruldu, sistem proxy ayarları kapatıldı.");
