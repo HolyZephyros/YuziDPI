@@ -200,8 +200,8 @@ static inline bool DownloadBinaryToFileWinHttp(const std::wstring& urlW, const s
 
 static inline DWORD WINAPI SilentOtaWorkerThreadProc(LPVOID param) {
     HWND hMainWnd = (HWND)param;
-    // Başlangıçta ağ ve yerel tünelin oturması için kısa bekleme
-    Sleep(4500);
+    // Başlangıçta arayüzün anında açılması için kısa bekleme (1.5 sn)
+    Sleep(1500);
 
     std::string json = HttpGetTextWinHttp(L"api.github.com", L"/repos/HolyZephyros/YuziDPI/releases/latest");
     if (json.empty()) {
