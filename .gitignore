@@ -5,3 +5,5 @@
 *.update
 yuzidpi.ini
 zerodpi.ini
+.agents/
+kural.md
