@@ -27,6 +27,9 @@ if %ERRORLEVEL% EQU 0 (
     del /q ZeroDPI.exe >nul 2>&1
     del /q zerodpi.ini >nul 2>&1
     echo [OK] Derleme Basarili: YuziDPI.exe hazir!
+    if "%WAS_RUNNING%"=="1" (
+        start "" "%~dp0YuziDPI.exe"
+    )
 ) else (
     echo [!] Derleme Hatasi!
     exit /b %ERRORLEVEL%

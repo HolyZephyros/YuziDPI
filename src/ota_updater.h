@@ -72,47 +72,51 @@ static inline std::string FindExeDownloadUrlInReleaseJson(const std::string& jso
 }
 
 static inline std::string HttpGetTextWinHttp(const wchar_t* host, const wchar_t* path) {
-    std::string result;
-    HINTERNET hSession = WinHttpOpen(L"YuziDPI-OTA/1.0",
-        WINHTTP_ACCESS_TYPE_DEFAULT_PROXY, WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0);
-    if (!hSession) return result;
+    const DWORD accessTypes[2] = { WINHTTP_ACCESS_TYPE_NO_PROXY, WINHTTP_ACCESS_TYPE_DEFAULT_PROXY };
+    for (int attempt = 0; attempt < 2; ++attempt) {
+        std::string result;
+        HINTERNET hSession = WinHttpOpen(L"YuziDPI-OTA/1.0",
+            accessTypes[attempt], WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0);
+        if (!hSession) continue;
 
-    WinHttpSetTimeouts(hSession, 6000, 6000, 8000, 8000);
+        WinHttpSetTimeouts(hSession, 5000, 5000, 7000, 7000);
 
-    HINTERNET hConnect = WinHttpConnect(hSession, host, INTERNET_DEFAULT_HTTPS_PORT, 0);
-    if (hConnect) {
-        HINTERNET hRequest = WinHttpOpenRequest(hConnect, L"GET", path,
-            NULL, WINHTTP_NO_REFERER, WINHTTP_DEFAULT_ACCEPT_TYPES, WINHTTP_FLAG_SECURE);
-        if (hRequest) {
-            DWORD redirectPolicy = WINHTTP_OPTION_REDIRECT_POLICY_ALWAYS;
-            WinHttpSetOption(hRequest, WINHTTP_OPTION_REDIRECT_POLICY, &redirectPolicy, sizeof(redirectPolicy));
+        HINTERNET hConnect = WinHttpConnect(hSession, host, INTERNET_DEFAULT_HTTPS_PORT, 0);
+        if (hConnect) {
+            HINTERNET hRequest = WinHttpOpenRequest(hConnect, L"GET", path,
+                NULL, WINHTTP_NO_REFERER, WINHTTP_DEFAULT_ACCEPT_TYPES, WINHTTP_FLAG_SECURE);
+            if (hRequest) {
+                DWORD redirectPolicy = WINHTTP_OPTION_REDIRECT_POLICY_ALWAYS;
+                WinHttpSetOption(hRequest, WINHTTP_OPTION_REDIRECT_POLICY, &redirectPolicy, sizeof(redirectPolicy));
 
-            const wchar_t* hdrs = L"Accept: application/vnd.github+json\r\nUser-Agent: YuziDPI-OTA/1.0\r\n";
-            if (WinHttpSendRequest(hRequest, hdrs, (DWORD)-1L, WINHTTP_NO_REQUEST_DATA, 0, 0, 0) &&
-                WinHttpReceiveResponse(hRequest, NULL)) {
-                DWORD statusCode = 0;
-                DWORD sz = sizeof(statusCode);
-                WinHttpQueryHeaders(hRequest, WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER,
-                    WINHTTP_HEADER_NAME_BY_INDEX, &statusCode, &sz, WINHTTP_NO_HEADER_INDEX);
-                if (statusCode == 200) {
-                    DWORD dwSize = 0;
-                    do {
-                        dwSize = 0;
-                        if (!WinHttpQueryDataAvailable(hRequest, &dwSize) || dwSize == 0) break;
-                        std::vector<char> buf(dwSize);
-                        DWORD dwRead = 0;
-                        if (WinHttpReadData(hRequest, buf.data(), dwSize, &dwRead) && dwRead > 0) {
-                            result.append(buf.data(), dwRead);
-                        }
-                    } while (dwSize > 0 && result.size() < 512 * 1024);
+                const wchar_t* hdrs = L"Accept: application/vnd.github+json\r\nUser-Agent: YuziDPI-OTA/1.0\r\n";
+                if (WinHttpSendRequest(hRequest, hdrs, (DWORD)-1L, WINHTTP_NO_REQUEST_DATA, 0, 0, 0) &&
+                    WinHttpReceiveResponse(hRequest, NULL)) {
+                    DWORD statusCode = 0;
+                    DWORD sz = sizeof(statusCode);
+                    WinHttpQueryHeaders(hRequest, WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER,
+                        WINHTTP_HEADER_NAME_BY_INDEX, &statusCode, &sz, WINHTTP_NO_HEADER_INDEX);
+                    if (statusCode == 200) {
+                        DWORD dwSize = 0;
+                        do {
+                            dwSize = 0;
+                            if (!WinHttpQueryDataAvailable(hRequest, &dwSize) || dwSize == 0) break;
+                            std::vector<char> buf(dwSize);
+                            DWORD dwRead = 0;
+                            if (WinHttpReadData(hRequest, buf.data(), dwSize, &dwRead) && dwRead > 0) {
+                                result.append(buf.data(), dwRead);
+                            }
+                        } while (dwSize > 0 && result.size() < 512 * 1024);
+                    }
                 }
+                WinHttpCloseHandle(hRequest);
             }
-            WinHttpCloseHandle(hRequest);
+            WinHttpCloseHandle(hConnect);
         }
-        WinHttpCloseHandle(hConnect);
+        WinHttpCloseHandle(hSession);
+        if (!result.empty()) return result;
     }
-    WinHttpCloseHandle(hSession);
-    return result;
+    return "";
 }
 
 static inline bool DownloadBinaryToFileWinHttp(const std::wstring& urlW, const std::wstring& destPath) {
@@ -129,73 +133,78 @@ static inline bool DownloadBinaryToFileWinHttp(const std::wstring& urlW, const s
         return false;
     }
 
-    HINTERNET hSession = WinHttpOpen(L"YuziDPI-OTA/1.0",
-        WINHTTP_ACCESS_TYPE_DEFAULT_PROXY, WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0);
-    if (!hSession) return false;
+    const DWORD accessTypes[2] = { WINHTTP_ACCESS_TYPE_NO_PROXY, WINHTTP_ACCESS_TYPE_DEFAULT_PROXY };
+    for (int attempt = 0; attempt < 2; ++attempt) {
+        HINTERNET hSession = WinHttpOpen(L"YuziDPI-OTA/1.0",
+            accessTypes[attempt], WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0);
+        if (!hSession) continue;
 
-    WinHttpSetTimeouts(hSession, 8000, 8000, 15000, 30000);
+        WinHttpSetTimeouts(hSession, 6000, 6000, 15000, 30000);
 
-    bool ok = false;
-    HINTERNET hConnect = WinHttpConnect(hSession, hostName, uc.nPort, 0);
-    if (hConnect) {
-        DWORD flags = (uc.nScheme == INTERNET_SCHEME_HTTPS) ? WINHTTP_FLAG_SECURE : 0;
-        HINTERNET hRequest = WinHttpOpenRequest(hConnect, L"GET", urlPath,
-            NULL, WINHTTP_NO_REFERER, WINHTTP_DEFAULT_ACCEPT_TYPES, flags);
-        if (hRequest) {
-            DWORD redirectPolicy = WINHTTP_OPTION_REDIRECT_POLICY_ALWAYS;
-            WinHttpSetOption(hRequest, WINHTTP_OPTION_REDIRECT_POLICY, &redirectPolicy, sizeof(redirectPolicy));
+        bool ok = false;
+        HINTERNET hConnect = WinHttpConnect(hSession, hostName, uc.nPort, 0);
+        if (hConnect) {
+            DWORD flags = (uc.nScheme == INTERNET_SCHEME_HTTPS) ? WINHTTP_FLAG_SECURE : 0;
+            HINTERNET hRequest = WinHttpOpenRequest(hConnect, L"GET", urlPath,
+                NULL, WINHTTP_NO_REFERER, WINHTTP_DEFAULT_ACCEPT_TYPES, flags);
+            if (hRequest) {
+                DWORD redirectPolicy = WINHTTP_OPTION_REDIRECT_POLICY_ALWAYS;
+                WinHttpSetOption(hRequest, WINHTTP_OPTION_REDIRECT_POLICY, &redirectPolicy, sizeof(redirectPolicy));
 
-            if (WinHttpSendRequest(hRequest, WINHTTP_NO_ADDITIONAL_HEADERS, 0, WINHTTP_NO_REQUEST_DATA, 0, 0, 0) &&
-                WinHttpReceiveResponse(hRequest, NULL)) {
-                DWORD statusCode = 0;
-                DWORD sz = sizeof(statusCode);
-                WinHttpQueryHeaders(hRequest, WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER,
-                    WINHTTP_HEADER_NAME_BY_INDEX, &statusCode, &sz, WINHTTP_NO_HEADER_INDEX);
+                const wchar_t* hdrs = L"User-Agent: YuziDPI-OTA/1.0\r\nAccept: */*\r\n";
+                if (WinHttpSendRequest(hRequest, hdrs, (DWORD)-1L, WINHTTP_NO_REQUEST_DATA, 0, 0, 0) &&
+                    WinHttpReceiveResponse(hRequest, NULL)) {
+                    DWORD statusCode = 0;
+                    DWORD sz = sizeof(statusCode);
+                    WinHttpQueryHeaders(hRequest, WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER,
+                        WINHTTP_HEADER_NAME_BY_INDEX, &statusCode, &sz, WINHTTP_NO_HEADER_INDEX);
 
-                if (statusCode == 200) {
-                    HANDLE hFile = CreateFileW(destPath.c_str(), GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
-                    if (hFile != INVALID_HANDLE_VALUE) {
-                        DWORD totalWritten = 0;
-                        BYTE firstTwo[2] = {0, 0};
-                        DWORD dwSize = 0;
-                        bool writeErr = false;
+                    if (statusCode == 200) {
+                        HANDLE hFile = CreateFileW(destPath.c_str(), GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+                        if (hFile != INVALID_HANDLE_VALUE) {
+                            DWORD totalWritten = 0;
+                            BYTE firstTwo[2] = {0, 0};
+                            DWORD dwSize = 0;
+                            bool writeErr = false;
 
-                        do {
-                            dwSize = 0;
-                            if (!WinHttpQueryDataAvailable(hRequest, &dwSize) || dwSize == 0) break;
-                            std::vector<BYTE> buf(dwSize);
-                            DWORD dwRead = 0;
-                            if (WinHttpReadData(hRequest, buf.data(), dwSize, &dwRead) && dwRead > 0) {
-                                if (totalWritten == 0 && dwRead >= 2) {
-                                    firstTwo[0] = buf[0];
-                                    firstTwo[1] = buf[1];
+                            do {
+                                dwSize = 0;
+                                if (!WinHttpQueryDataAvailable(hRequest, &dwSize) || dwSize == 0) break;
+                                std::vector<BYTE> buf(dwSize);
+                                DWORD dwRead = 0;
+                                if (WinHttpReadData(hRequest, buf.data(), dwSize, &dwRead) && dwRead > 0) {
+                                    if (totalWritten == 0 && dwRead >= 2) {
+                                        firstTwo[0] = buf[0];
+                                        firstTwo[1] = buf[1];
+                                    }
+                                    DWORD dwWritten = 0;
+                                    if (!WriteFile(hFile, buf.data(), dwRead, &dwWritten, NULL) || dwWritten != dwRead) {
+                                        writeErr = true;
+                                        break;
+                                    }
+                                    totalWritten += dwWritten;
                                 }
-                                DWORD dwWritten = 0;
-                                if (!WriteFile(hFile, buf.data(), dwRead, &dwWritten, NULL) || dwWritten != dwRead) {
-                                    writeErr = true;
-                                    break;
-                                }
-                                totalWritten += dwWritten;
+                            } while (dwSize > 0);
+
+                            CloseHandle(hFile);
+
+                            // Geçerli bir Windows PE (.exe) başlığı ('MZ') ve en az 100 KB boyut doğrulaması
+                            if (!writeErr && totalWritten > 100 * 1024 && firstTwo[0] == 'M' && firstTwo[1] == 'Z') {
+                                ok = true;
+                            } else {
+                                DeleteFileW(destPath.c_str());
                             }
-                        } while (dwSize > 0);
-
-                        CloseHandle(hFile);
-
-                        // Geçerli bir Windows PE (.exe) başlığı ('MZ') ve en az 100 KB boyut doğrulaması
-                        if (!writeErr && totalWritten > 100 * 1024 && firstTwo[0] == 'M' && firstTwo[1] == 'Z') {
-                            ok = true;
-                        } else {
-                            DeleteFileW(destPath.c_str());
                         }
                     }
                 }
+                WinHttpCloseHandle(hRequest);
             }
-            WinHttpCloseHandle(hRequest);
+            WinHttpCloseHandle(hConnect);
         }
-        WinHttpCloseHandle(hConnect);
+        WinHttpCloseHandle(hSession);
+        if (ok) return true;
     }
-    WinHttpCloseHandle(hSession);
-    return ok;
+    return false;
 }
 
 static inline DWORD WINAPI SilentOtaWorkerThreadProc(LPVOID param) {
