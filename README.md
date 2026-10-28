@@ -2,7 +2,7 @@
 
 **YuziDPI**, Windows için geliştirilmiş, çekirdek sürücüsü gerektirmeyen, tek dosya (`.exe`), ultra hafif (**~1.2 MB RAM**) **Akıllı Yerel Tünel & Ağ Paket Optimizasyon** aracıdır.
 
-> **[⬇ Son Sürümü İndir (YuziDPI.exe — v1.0.1)](https://github.com/HolyZephyros/YuziDPI/releases/latest/download/YuziDPI.exe)**
+> **[⬇ Son Sürümü İndir (YuziDPI.exe — v1.0.2)](https://github.com/HolyZephyros/YuziDPI/releases/latest/download/YuziDPI.exe)**
 
 ---
 
