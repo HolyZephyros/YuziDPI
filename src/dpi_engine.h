@@ -27,13 +27,13 @@
 #endif
 extern "C" BOOL WINAPI InternetSetOptionW(LPVOID hInternet, DWORD dwOption, LPVOID lpBuffer, DWORD dwBufferLength);
 
-// 6 Kademeli Optimize Manuel DPI Bypass Merdiveni (En hafif 0ms'den en güçlüye)
+// 6 Kademeli Paket Optimizasyon Merdiveni (En hafif 0ms'den en güçlüye)
 enum BypassStage : int {
-    STAGE_0_DIRECT            = 0, // Doğrudan geçiş (%0 müdahale - Oyunlar ve normal siteler)
-    STAGE_1_FAST_TLS_REC      = 1, // Kademe 1 (En Hafif - 0ms): Tek Paket TLS Record SNI Bölme (TTNET / TurkNet / Vodafone)
-    STAGE_2_DUAL_PKT_0MS      = 2, // Kademe 2 (Çok Hafif - 0ms): 1-Byte Başlık + Çift Paket Mikro Zarf (0ms Gecikme)
+    STAGE_0_DIRECT            = 0, // Doğrudan geçiş (%0 müdahale)
+    STAGE_1_FAST_TLS_REC      = 1, // Kademe 1 (En Hafif - 0ms): Tek Paket TLS Record SNI Bölme
+    STAGE_2_DUAL_PKT_0MS      = 2, // Kademe 2 (Çok Hafif - 0ms): 1-Byte Başlık + Çift Paket Mikro Zarf
     STAGE_3_MICRO_1MS         = 3, // Kademe 3 (Hafif+ - 1ms): 3'lü Mikro TLS Zarfı + Hızlı TCP Bölme
-    STAGE_4_HYBRID_SUPER      = 4, // Kademe 4 (Dengeli Güçlü): Hibrit Mikro TLS Zarfı + Ayrı Segment (Superonline / Kablonet)
+    STAGE_4_HYBRID_SUPER      = 4, // Kademe 4 (Dengeli Güçlü): Hibrit Mikro TLS Zarfı + Ayrı Segment
     STAGE_5_ANYCAST_ULTRA     = 5, // Kademe 5 (Maksimum Güç): Anycast Temiz IP + Tam Mikro TLS Desync
     STAGE_6_UPSTREAM_TUNNEL   = 6  // Kademe 6: Harici SOCKS5 Tünel Köprüsü (127.0.0.1:40000 vb.)
 };
@@ -141,7 +141,6 @@ private:
     SOCKET ConnectToTarget(const std::string& host, uint16_t port, BypassStage stage);
     SOCKET ConnectViaUpstreamSocks5(const std::string& targetHost, uint16_t targetPort);
 
-    bool IsGameOrExcludedHost(const std::string& host) const;
     bool IsUserExcludedHost(const std::string& host) const;
     bool IsTargetInBypassList(const std::string& host) const;
     bool ShouldBypassConnection(const std::string& host, const std::wstring& clientFullPath, const std::wstring& clientExeName, std::wstring& outReason) const;

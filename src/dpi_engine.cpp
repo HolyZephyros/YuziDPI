@@ -193,6 +193,9 @@ void ZeroDpiEngine::ApplyLiveSwitch(bool stageChanged) {
     }
 
     if (m_running.load()) {
+        if (!stageChanged && m_useSystemPac.load()) {
+            EnableSystemSmartPac(true);
+        }
         for (SOCKET s : toReset) {
             if (s != INVALID_SOCKET) {
                 shutdown(s, SD_BOTH);
@@ -239,8 +242,8 @@ void ZeroDpiEngine::AddTunnelItem(TunnelItemType type, const std::wstring& pathO
     {
         std::lock_guard<std::mutex> lock(m_mutex);
         for (auto& existing : m_tunnelItems) {
-            if (_wcsicmp(existing.pathOrDomain.c_str(), cleanVal.c_str()) == 0) {
-                existing.isExcluded = isExcluded;
+            if (existing.type == type && existing.isExcluded == isExcluded &&
+                _wcsicmp(existing.pathOrDomain.c_str(), cleanVal.c_str()) == 0) {
                 return;
             }
         }
@@ -284,31 +287,14 @@ bool ZeroDpiEngine::IsUserExcludedHost(const std::string& host) const {
     std::string h = ToLowerAscii(host);
     std::lock_guard<std::mutex> lock(m_mutex);
     for (const auto& item : m_tunnelItems) {
-        if (!item.isExcluded) continue;
-        std::string d = ToLowerAscii(WideToUtf8(item.type == ITEM_DOMAIN ? item.pathOrDomain : item.displayName));
-        size_t dotExe = d.rfind(".exe");
-        if (dotExe != std::string::npos) d.resize(dotExe);
+        if (!item.isExcluded || !item.enabled || item.type != ITEM_DOMAIN) continue;
+        std::string d = ToLowerAscii(WideToUtf8(item.pathOrDomain));
         if (d.empty()) continue;
-        if (h == d || h.find(d) != std::string::npos) return true;
-    }
-    return false;
-}
-
-bool ZeroDpiEngine::IsGameOrExcludedHost(const std::string& host) const {
-    int scope = m_scopeMode.load();
-    if (scope == SCOPE_FULL_SYSTEM) return false;
-    if (scope == SCOPE_ALL_EXCEPT_EXCLUDED && IsUserExcludedHost(host)) return true;
-
-    std::string h = ToLowerAscii(host);
-    const char* gameKeywords[] = {
-        "callofduty", "demonware", "activision", "battle.net", "blizzard",
-        "steampowered", "steamcommunity", "steamcontent", "valve",
-        "riotgames", "pvp.net", "valorant", "easyanticheat", "battleye",
-        "epicgames", "ea.com", "origin.com", "xboxlive", "playstation",
-        "faceit", "gov.tr", "edu.tr", "garanti", "isbank", "ziraat", "akbank"
-    };
-    for (const char* kw : gameKeywords) {
-        if (h.find(kw) != std::string::npos) return true;
+        if (h == d) return true;
+        if (h.size() > d.size() && h.compare(h.size() - d.size(), d.size(), d) == 0 &&
+            h[h.size() - d.size() - 1] == '.') {
+            return true;
+        }
     }
     return false;
 }
@@ -316,9 +302,8 @@ bool ZeroDpiEngine::IsGameOrExcludedHost(const std::string& host) const {
 bool ZeroDpiEngine::IsTargetInBypassList(const std::string& host) const {
     int scope = m_scopeMode.load();
     if (scope == SCOPE_FULL_SYSTEM) return true;
-    if (IsGameOrExcludedHost(host)) return false;
     if (scope == SCOPE_ALL_EXCEPT_EXCLUDED) {
-        return true;
+        return !IsUserExcludedHost(host);
     }
 
     std::string h = ToLowerAscii(host);
@@ -328,6 +313,7 @@ bool ZeroDpiEngine::IsTargetInBypassList(const std::string& host) const {
         if (item.isExcluded || !item.enabled) continue;
         if (item.type == ITEM_DOMAIN) {
             std::string d = ToLowerAscii(WideToUtf8(item.pathOrDomain));
+            if (d.empty()) continue;
             if (h == d) return true;
             if (h.size() > d.size() && h.compare(h.size() - d.size(), d.size(), d) == 0 &&
                 h[h.size() - d.size() - 1] == '.') {
@@ -415,11 +401,11 @@ bool ZeroDpiEngine::ShouldBypassConnection(const std::string& host, const std::w
 
     // Mod 2: Belirtilenler Dışında Tüm Sistem (Hariç Tutma Modu)
     if (scope == SCOPE_ALL_EXCEPT_EXCLUDED) {
-        if (IsGameOrExcludedHost(host)) return false;
+        if (IsUserExcludedHost(host)) return false;
         if (!clientFullPath.empty()) {
             std::lock_guard<std::mutex> lock(m_mutex);
             for (const auto& item : m_tunnelItems) {
-                if (!item.isExcluded) continue;
+                if (!item.isExcluded || !item.enabled) continue;
                 if (item.type == ITEM_FOLDER && PathStartsWithFolder(clientFullPath, item.pathOrDomain)) {
                     return false;
                 }
@@ -435,8 +421,6 @@ bool ZeroDpiEngine::ShouldBypassConnection(const std::string& host, const std::w
     }
 
     // Mod 1: Sadece Listedeki Uygulama, Klasör ve Siteler (SCOPE_ONLY_LISTED)
-    if (IsGameOrExcludedHost(host)) return false;
-
     {
         std::lock_guard<std::mutex> lock(m_mutex);
         if (!clientFullPath.empty()) {
@@ -1138,25 +1122,18 @@ void ZeroDpiEngine::ServePacFile(SOCKET clientSock) {
     std::string pacBody =
         "function FindProxyForURL(url, host) {\r\n"
         "  host = host.toLowerCase();\r\n"
-        "  if (isPlainHostName(host) || shExpMatch(host, '127.*') || shExpMatch(host, '192.168.*') || shExpMatch(host, '10.*')) {\r\n"
+        "  if (isPlainHostName(host) || shExpMatch(host, 'localhost') || shExpMatch(host, '127.*') || shExpMatch(host, '192.168.*') || shExpMatch(host, '10.*') || shExpMatch(host, '172.16.*')) {\r\n"
         "    return 'DIRECT';\r\n"
         "  }\r\n";
 
-    if (scope != SCOPE_FULL_SYSTEM) {
-        pacBody +=
-            "  if (shExpMatch(host, '*.callofduty.com') || shExpMatch(host, '*.demonware.net') ||\r\n"
-            "      shExpMatch(host, '*.battle.net') || shExpMatch(host, '*.steampowered.com') ||\r\n"
-            "      shExpMatch(host, '*.riotgames.com') || shExpMatch(host, '*.gov.tr') || shExpMatch(host, '*.edu.tr')) {\r\n"
-            "    return 'DIRECT';\r\n"
-            "  }\r\n";
-    }
-
-    // Kullanıcının Hariç Tut (isExcluded=true) olarak işaretlediği domainler her zaman DIRECT
-    for (const auto& it : items) {
-        if (!it.isExcluded || it.type != ITEM_DOMAIN) continue;
-        std::string d = ToLowerAscii(WideToUtf8(it.pathOrDomain));
-        if (d.empty()) continue;
-        pacBody += "  if (dnsDomainIs(host, '" + d + "') || shExpMatch(host, '*." + d + "')) return 'DIRECT';\r\n";
+    // Hariç Tutma Modunda (SCOPE_ALL_EXCEPT_EXCLUDED) kullanıcının işaretlediği domainler DIRECT geçer
+    if (scope == SCOPE_ALL_EXCEPT_EXCLUDED) {
+        for (const auto& it : items) {
+            if (!it.isExcluded || !it.enabled || it.type != ITEM_DOMAIN) continue;
+            std::string d = ToLowerAscii(WideToUtf8(it.pathOrDomain));
+            if (d.empty()) continue;
+            pacBody += "  if (dnsDomainIs(host, '" + d + "') || shExpMatch(host, '*." + d + "')) return 'DIRECT';\r\n";
+        }
     }
 
     char proxyRet[160];
@@ -1747,14 +1724,21 @@ bool ZeroDpiEngine::EnableSystemSmartPac(bool enable) {
         wchar_t proxyServer[64];
         _snwprintf_s(proxyServer, _countof(proxyServer), _TRUNCATE, L"127.0.0.1:%u", m_httpPort);
 
-        const wchar_t* proxyOverride =
-            L"*.callofduty.com;*.demonware.net;*.activision.com;*.battle.net;*.blizzard.com;"
-            L"*.steampowered.com;*.steamcommunity.com;*.steamcontent.com;*.riotgames.com;"
-            L"*.pvp.net;*.epicgames.com;*.ea.com;*.gov.tr;*.edu.tr;localhost;127.*;192.168.*;10.*;<local>";
+        std::wstring proxyOverride = L"localhost;127.*;192.168.*;10.*;172.16.*;<local>";
+        if (m_scopeMode.load() == SCOPE_ALL_EXCEPT_EXCLUDED) {
+            std::vector<TunnelTargetItem> items = GetTunnelItems();
+            for (const auto& it : items) {
+                if (!it.isExcluded || !it.enabled || it.type != ITEM_DOMAIN || it.pathOrDomain.empty()) continue;
+                std::wstring entry = L";" + it.pathOrDomain + L";*." + it.pathOrDomain;
+                if (proxyOverride.size() + entry.size() < 1800) {
+                    proxyOverride += entry;
+                }
+            }
+        }
 
         RegSetValueExW(hKey, L"ProxyEnable", 0, REG_DWORD, (const BYTE*)&proxyEnable, sizeof(proxyEnable));
         RegSetValueExW(hKey, L"ProxyServer", 0, REG_SZ, (const BYTE*)proxyServer, (DWORD)((wcslen(proxyServer) + 1) * sizeof(wchar_t)));
-        RegSetValueExW(hKey, L"ProxyOverride", 0, REG_SZ, (const BYTE*)proxyOverride, (DWORD)((wcslen(proxyOverride) + 1) * sizeof(wchar_t)));
+        RegSetValueExW(hKey, L"ProxyOverride", 0, REG_SZ, (const BYTE*)proxyOverride.c_str(), (DWORD)((proxyOverride.size() + 1) * sizeof(wchar_t)));
         RegDeleteValueW(hKey, L"AutoConfigURL");
     } else {
         DWORD proxyEnable = 0;
