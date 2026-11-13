@@ -1991,9 +1991,16 @@ void ZeroDpiEngine::LoadConfig(const std::wstring& iniPath, bool& outAutoConnect
                 }
             }
         }
-        // updates.discord.com ve dl.discordapp.net eski ini dosyasında yoksa ekle
+        // updates.discord.com, dl.discordapp.net, cdn.discordapp.com ve media.discordapp.net eski ini dosyasında yoksa ekle
         AddTunnelItem(ITEM_DOMAIN, L"updates.discord.com", false);
         AddTunnelItem(ITEM_DOMAIN, L"dl.discordapp.net", false);
+        int migratedV = GetPrivateProfileIntW(L"Settings", L"DefaultMigration", 0, iniPath.c_str());
+        if (migratedV < 104) {
+            AddTunnelItem(ITEM_DOMAIN, L"cdn.discordapp.com", false);
+            AddTunnelItem(ITEM_DOMAIN, L"media.discordapp.net", false);
+            SaveConfig(iniPath, outAutoConnect, outAutoLaunchApps, outStartMinimized);
+            WritePrivateProfileStringW(L"Settings", L"DefaultMigration", L"104", iniPath.c_str());
+        }
     }
 }
 
