@@ -25,7 +25,24 @@
 #ifndef INTERNET_OPTION_SETTINGS_CHANGED
 #define INTERNET_OPTION_SETTINGS_CHANGED 39
 #endif
+#ifndef INTERNET_OPTION_PER_CONNECTION_OPTION
+#define INTERNET_OPTION_PER_CONNECTION_OPTION 75
+#endif
+#ifndef INTERNET_PER_CONN_FLAGS
+#define INTERNET_PER_CONN_FLAGS 1
+#define INTERNET_PER_CONN_PROXY_SERVER 2
+#define INTERNET_PER_CONN_PROXY_BYPASS 3
+#define INTERNET_PER_CONN_AUTOCONFIG_URL 4
+#define PROXY_TYPE_DIRECT 0x00000001
+#define PROXY_TYPE_PROXY 0x00000002
+#define PROXY_TYPE_AUTO_PROXY_URL 0x00000004
+#endif
 extern "C" BOOL WINAPI InternetSetOptionW(LPVOID hInternet, DWORD dwOption, LPVOID lpBuffer, DWORD dwBufferLength);
+
+struct DohCacheEntry {
+    std::string ip;
+    ULONGLONG expireTick64{0};
+};
 
 // 6 Kademeli Paket Optimizasyon Merdiveni (En hafif 0ms'den en güçlüye)
 enum BypassStage : int {
@@ -143,6 +160,7 @@ private:
 
     bool IsUserExcludedHost(const std::string& host) const;
     bool IsTargetInBypassList(const std::string& host) const;
+    bool ResolveBypassDecisionFast(SOCKET clientSock, const std::string& host, std::wstring& outClientExe, std::wstring& outReason) const;
     bool ShouldBypassConnection(const std::string& host, const std::wstring& clientFullPath, const std::wstring& clientExeName, std::wstring& outReason) const;
     bool LaunchSingleExeTunneled(const std::wstring& exePath);
 
@@ -161,6 +179,7 @@ private:
     std::atomic<int>  m_probeStage{STAGE_1_FAST_TLS_REC};
     std::atomic<int>  m_lastLatencyMs{0};
     std::atomic<int>  m_activeWorkers{0};
+    std::atomic<uint32_t> m_pacVersion{1};
 
     uint16_t m_httpPort{3131};
     uint16_t m_socksPort{1080};
@@ -174,7 +193,7 @@ private:
     std::atomic<uint16_t> m_upstreamPort{40000};
 
     mutable std::mutex m_mutex;
-    std::map<std::string, std::string> m_dohCache;
+    std::map<std::string, DohCacheEntry> m_dohCache;
     std::map<std::string, BypassStage> m_domainStageCache;
     std::vector<TunnelTargetItem> m_tunnelItems;
     std::vector<SOCKET> m_activeRelaySocks;

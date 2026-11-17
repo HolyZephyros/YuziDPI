@@ -2,6 +2,7 @@
 #include <stdarg.h>
 #include <algorithm>
 #include <cstring>
+#include <cwctype>
 
 struct ClientWorkerCtx {
     ZeroDpiEngine* engine;
@@ -324,7 +325,13 @@ bool ZeroDpiEngine::IsTargetInBypassList(const std::string& host) const {
     return false;
 }
 
-// Yerel tünele (127.0.0.1:3131) bağlanan soketin hangi .exe ve klasörden geldiğini bulur
+struct CachedPidImage {
+    std::wstring fullPath;
+    std::wstring exeName;
+    ULONGLONG expireTick64{0};
+};
+
+// Yerel tünele (127.0.0.1:3131) bağlanan soketin hangi .exe ve klasörden geldiğini bulur (PID önbellekli)
 static bool GetSocketOwnerProcess(SOCKET clientSock, std::wstring& outFullPath, std::wstring& outExeName, DWORD* outOwnerPid = nullptr) {
     outFullPath.clear();
     outExeName.clear();
@@ -365,6 +372,19 @@ static bool GetSocketOwnerProcess(SOCKET clientSock, std::wstring& outFullPath, 
     if (ownerPid == 0) return false;
     if (outOwnerPid) *outOwnerPid = ownerPid;
 
+    static std::mutex s_pidCacheMutex;
+    static std::map<DWORD, CachedPidImage> s_pidCache;
+    ULONGLONG now64 = GetTickCount64();
+    {
+        std::lock_guard<std::mutex> lk(s_pidCacheMutex);
+        auto it = s_pidCache.find(ownerPid);
+        if (it != s_pidCache.end() && now64 < it->second.expireTick64) {
+            outFullPath = it->second.fullPath;
+            outExeName = it->second.exeName;
+            return true;
+        }
+    }
+
     HANDLE hProc = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, ownerPid);
     if (!hProc) return false;
 
@@ -376,6 +396,9 @@ static bool GetSocketOwnerProcess(SOCKET clientSock, std::wstring& outFullPath, 
     if (ok && pathLen > 0) {
         outFullPath.assign(pathBuf, pathLen);
         outExeName = ExtractFileName(outFullPath);
+        std::lock_guard<std::mutex> lk(s_pidCacheMutex);
+        if (s_pidCache.size() >= 128) s_pidCache.clear();
+        s_pidCache[ownerPid] = CachedPidImage{ outFullPath, outExeName, now64 + 15000ULL };
         return true;
     }
     return false;
@@ -387,6 +410,62 @@ static bool PathStartsWithFolder(const std::wstring& fullPath, const std::wstrin
     if (fullPath.size() == folderPath.size()) return true;
     wchar_t nextCh = fullPath[folderPath.size()];
     return (nextCh == L'\\' || nextCh == L'/' || folderPath.back() == L'\\' || folderPath.back() == L'/');
+}
+
+bool ZeroDpiEngine::ResolveBypassDecisionFast(SOCKET clientSock, const std::string& host, std::wstring& outClientExe, std::wstring& outReason) const {
+    outClientExe.clear();
+    outReason.clear();
+    int scope = m_scopeMode.load();
+
+    if (scope == SCOPE_FULL_SYSTEM) {
+        outReason = L"Tüm Sistem";
+        return true;
+    }
+
+    if (scope == SCOPE_ONLY_LISTED) {
+        if (IsTargetInBypassList(host)) {
+            outReason = L"Site Kuralı";
+            return true;
+        }
+        bool hasAppOrFolderRules = false;
+        {
+            std::lock_guard<std::mutex> lock(m_mutex);
+            for (const auto& item : m_tunnelItems) {
+                if (!item.isExcluded && item.enabled && (item.type == ITEM_APP_EXE || item.type == ITEM_FOLDER)) {
+                    hasAppOrFolderRules = true;
+                    break;
+                }
+            }
+        }
+        if (!hasAppOrFolderRules) {
+            return false;
+        }
+        std::wstring clientFullPath;
+        GetSocketOwnerProcess(clientSock, clientFullPath, outClientExe);
+        return ShouldBypassConnection(host, clientFullPath, outClientExe, outReason);
+    }
+
+    // SCOPE_ALL_EXCEPT_EXCLUDED
+    if (IsUserExcludedHost(host)) {
+        return false;
+    }
+    bool hasExclAppOrFolderRules = false;
+    {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        for (const auto& item : m_tunnelItems) {
+            if (item.isExcluded && item.enabled && (item.type == ITEM_APP_EXE || item.type == ITEM_FOLDER)) {
+                hasExclAppOrFolderRules = true;
+                break;
+            }
+        }
+    }
+    if (!hasExclAppOrFolderRules) {
+        outReason = L"Hariç Dışı Sistem";
+        return true;
+    }
+    std::wstring clientFullPath;
+    GetSocketOwnerProcess(clientSock, clientFullPath, outClientExe);
+    return ShouldBypassConnection(host, clientFullPath, outClientExe, outReason);
 }
 
 bool ZeroDpiEngine::ShouldBypassConnection(const std::string& host, const std::wstring& clientFullPath, const std::wstring& clientExeName, std::wstring& outReason) const {
@@ -588,14 +667,20 @@ std::string ZeroDpiEngine::ResolveDoH(const std::string& host, BypassStage stage
     std::string lowerHost = ToLowerAscii(host);
 
     if (stage == STAGE_5_ANYCAST_ULTRA || stage == STAGE_6_UPSTREAM_TUNNEL) {
-        std::string anycastIp = GetVerifiedDiscordFallbackIp(lowerHost, (int)(GetTickCount() & 0x7F));
+        std::string anycastIp = GetVerifiedDiscordFallbackIp(lowerHost, (int)(GetTickCount64() & 0x7F));
         if (!anycastIp.empty()) return anycastIp;
     }
 
+    ULONGLONG now64 = GetTickCount64();
     {
         std::lock_guard<std::mutex> lock(m_mutex);
         auto it = m_dohCache.find(lowerHost);
-        if (it != m_dohCache.end()) return it->second;
+        if (it != m_dohCache.end()) {
+            if (now64 < it->second.expireTick64) {
+                return it->second.ip;
+            }
+            m_dohCache.erase(it);
+        }
     }
 
     std::string resolvedIp;
@@ -613,7 +698,8 @@ std::string ZeroDpiEngine::ResolveDoH(const std::string& host, BypassStage stage
         }
         if (!resolvedIp.empty()) {
             std::lock_guard<std::mutex> lock(m_mutex);
-            m_dohCache[lowerHost] = resolvedIp;
+            if (m_dohCache.size() >= 512) m_dohCache.clear();
+            m_dohCache[lowerHost] = DohCacheEntry{ resolvedIp, GetTickCount64() + 180000ULL }; // 3 dk TTL
             return resolvedIp;
         }
     }
@@ -709,7 +795,7 @@ std::string ZeroDpiEngine::ResolveDoH(const std::string& host, BypassStage stage
         if (m_dohCache.size() >= 512) {
             m_dohCache.clear();
         }
-        m_dohCache[lowerHost] = resolvedIp;
+        m_dohCache[lowerHost] = DohCacheEntry{ resolvedIp, GetTickCount64() + 600000ULL }; // 10 dk TTL
     }
     return resolvedIp;
 }
@@ -1119,6 +1205,14 @@ void ZeroDpiEngine::ServePacFile(SOCKET clientSock) {
     std::vector<TunnelTargetItem> items = GetTunnelItems();
     int scope = m_scopeMode.load();
 
+    std::wstring callerFullPath, callerExeName;
+    GetSocketOwnerProcess(clientSock, callerFullPath, callerExeName);
+
+    char proxyRet[160];
+    _snprintf_s(proxyRet, sizeof(proxyRet), _TRUNCATE,
+        "PROXY 127.0.0.1:%u; SOCKS5 127.0.0.1:%u",
+        m_httpPort, m_socksPort);
+
     std::string pacBody =
         "function FindProxyForURL(url, host) {\r\n"
         "  host = host.toLowerCase();\r\n"
@@ -1126,42 +1220,105 @@ void ZeroDpiEngine::ServePacFile(SOCKET clientSock) {
         "    return 'DIRECT';\r\n"
         "  }\r\n";
 
-    // Hariç Tutma Modunda (SCOPE_ALL_EXCEPT_EXCLUDED) kullanıcının işaretlediği domainler DIRECT geçer
-    if (scope == SCOPE_ALL_EXCEPT_EXCLUDED) {
-        for (const auto& it : items) {
-            if (!it.isExcluded || !it.enabled || it.type != ITEM_DOMAIN) continue;
-            std::string d = ToLowerAscii(WideToUtf8(it.pathOrDomain));
-            if (d.empty()) continue;
-            pacBody += "  if (dnsDomainIs(host, '" + d + "') || shExpMatch(host, '*." + d + "')) return 'DIRECT';\r\n";
-        }
-    }
-
-    char proxyRet[160];
-    _snprintf_s(proxyRet, sizeof(proxyRet), _TRUNCATE,
-        "PROXY 127.0.0.1:%u; SOCKS5 127.0.0.1:%u",
-        m_httpPort, m_socksPort);
-
-    if (scope == SCOPE_ALL_EXCEPT_EXCLUDED || scope == SCOPE_FULL_SYSTEM) {
+    if (scope == SCOPE_FULL_SYSTEM) {
         pacBody += std::string("  return '") + proxyRet + "';\r\n}\r\n";
-    } else {
-        pacBody += "  if (";
-        bool first = true;
-        for (const auto& it : items) {
-            if (it.type != ITEM_DOMAIN || !it.enabled || it.isExcluded) continue;
-            std::string d = ToLowerAscii(WideToUtf8(it.pathOrDomain));
-            if (d.empty()) continue;
-            if (!first) pacBody += " ||\r\n      ";
-            first = false;
-            pacBody += "dnsDomainIs(host, '" + d + "') || shExpMatch(host, '*." + d + "')";
+    } else if (scope == SCOPE_ALL_EXCEPT_EXCLUDED) {
+        bool callerExcluded = false;
+        if (!callerFullPath.empty()) {
+            for (const auto& it : items) {
+                if (!it.isExcluded || !it.enabled) continue;
+                if (it.type == ITEM_FOLDER && PathStartsWithFolder(callerFullPath, it.pathOrDomain)) {
+                    callerExcluded = true;
+                    break;
+                }
+                if (it.type == ITEM_APP_EXE &&
+                    (_wcsicmp(callerFullPath.c_str(), it.pathOrDomain.c_str()) == 0 ||
+                     _wcsicmp(callerExeName.c_str(), it.displayName.c_str()) == 0)) {
+                    callerExcluded = true;
+                    break;
+                }
+            }
         }
-        if (first) pacBody += "dnsDomainIs(host, 'discord.com')";
-        pacBody += std::string(") {\r\n    return '") + proxyRet + "';\r\n  }\r\n  return 'DIRECT';\r\n}\r\n";
+        if (callerExcluded) {
+            pacBody += "  return 'DIRECT';\r\n}\r\n";
+        } else {
+            for (const auto& it : items) {
+                if (!it.isExcluded || !it.enabled || it.type != ITEM_DOMAIN) continue;
+                std::string d = ToLowerAscii(WideToUtf8(it.pathOrDomain));
+                if (d.empty()) continue;
+                pacBody += "  if (dnsDomainIs(host, '" + d + "') || shExpMatch(host, '*." + d + "')) return 'DIRECT';\r\n";
+            }
+            pacBody += std::string("  return '") + proxyRet + "';\r\n}\r\n";
+        }
+    } else {
+        // SCOPE_ONLY_LISTED
+        bool callerDirectlyMatched = false;
+        bool hasDiscordAppRule = false;
+        bool hasCustomAppOrFolderRule = false;
+
+        for (const auto& it : items) {
+            if (it.isExcluded || !it.enabled) continue;
+            if (it.type == ITEM_FOLDER || it.type == ITEM_APP_EXE) {
+                bool isDiscRule = (wcsstr(it.pathOrDomain.c_str(), L"Discord") != nullptr ||
+                                   wcsstr(it.pathOrDomain.c_str(), L"discord") != nullptr);
+                if (isDiscRule) hasDiscordAppRule = true;
+                else hasCustomAppOrFolderRule = true;
+
+                if (!callerFullPath.empty()) {
+                    if (it.type == ITEM_FOLDER && PathStartsWithFolder(callerFullPath, it.pathOrDomain)) {
+                        callerDirectlyMatched = true;
+                    } else if (it.type == ITEM_APP_EXE &&
+                               (_wcsicmp(callerFullPath.c_str(), it.pathOrDomain.c_str()) == 0 ||
+                                _wcsicmp(callerExeName.c_str(), it.displayName.c_str()) == 0)) {
+                        callerDirectlyMatched = true;
+                    }
+                }
+            }
+        }
+
+        bool isSharedSvcHost = (_wcsicmp(callerExeName.c_str(), L"svchost.exe") == 0);
+        if (callerDirectlyMatched || (isSharedSvcHost && hasCustomAppOrFolderRule)) {
+            pacBody += std::string("  return '") + proxyRet + "';\r\n}\r\n";
+        } else {
+            std::vector<std::string> pacDomains;
+            auto addUniqueDom = [&](const std::string& dom) {
+                if (dom.empty()) return;
+                for (const auto& ex : pacDomains) {
+                    if (ex == dom) return;
+                }
+                pacDomains.push_back(dom);
+            };
+
+            for (const auto& it : items) {
+                if (it.type != ITEM_DOMAIN || !it.enabled || it.isExcluded) continue;
+                addUniqueDom(ToLowerAscii(WideToUtf8(it.pathOrDomain)));
+            }
+            if (hasDiscordAppRule) {
+                addUniqueDom("discord.com");
+                addUniqueDom("discordapp.com");
+                addUniqueDom("discordapp.net");
+                addUniqueDom("discord.gg");
+                addUniqueDom("discord.media");
+            }
+
+            if (pacDomains.empty()) {
+                pacBody += "  return 'DIRECT';\r\n}\r\n";
+            } else {
+                pacBody += "  if (";
+                for (size_t i = 0; i < pacDomains.size(); ++i) {
+                    if (i > 0) pacBody += " ||\r\n      ";
+                    pacBody += "dnsDomainIs(host, '" + pacDomains[i] + "') || shExpMatch(host, '*." + pacDomains[i] + "')";
+                }
+                pacBody += std::string(") {\r\n    return '") + proxyRet + "';\r\n  }\r\n  return 'DIRECT';\r\n}\r\n";
+            }
+        }
     }
 
     char header[512];
     _snprintf_s(header, sizeof(header), _TRUNCATE,
         "HTTP/1.1 200 OK\r\n"
         "Content-Type: application/x-ns-proxy-autoconfig\r\n"
+        "Cache-Control: no-cache, no-store, must-revalidate\r\n"
         "Content-Length: %zu\r\n"
         "Connection: close\r\n\r\n",
         pacBody.size());
@@ -1171,12 +1328,15 @@ void ZeroDpiEngine::ServePacFile(SOCKET clientSock) {
 }
 
 int ZeroDpiEngine::RelaySockets(SOCKET s1, SOCKET s2) {
-    DWORD noTimeout = 0;
+    DWORD idleTimeout = 180000; // 3 dakika hareketsiz kalan boş bağlantıları otomatik kapat
     BOOL keepAlive = TRUE;
-    setsockopt(s1, SOL_SOCKET, SO_RCVTIMEO, (const char*)&noTimeout, sizeof(noTimeout));
-    setsockopt(s2, SOL_SOCKET, SO_RCVTIMEO, (const char*)&noTimeout, sizeof(noTimeout));
+    BOOL noDelay = TRUE;
+    setsockopt(s1, SOL_SOCKET, SO_RCVTIMEO, (const char*)&idleTimeout, sizeof(idleTimeout));
+    setsockopt(s2, SOL_SOCKET, SO_RCVTIMEO, (const char*)&idleTimeout, sizeof(idleTimeout));
     setsockopt(s1, SOL_SOCKET, SO_KEEPALIVE, (const char*)&keepAlive, sizeof(keepAlive));
     setsockopt(s2, SOL_SOCKET, SO_KEEPALIVE, (const char*)&keepAlive, sizeof(keepAlive));
+    setsockopt(s1, IPPROTO_TCP, TCP_NODELAY, (const char*)&noDelay, sizeof(noDelay));
+    setsockopt(s2, IPPROTO_TCP, TCP_NODELAY, (const char*)&noDelay, sizeof(noDelay));
 
     RegisterRelaySocket(s1);
     RegisterRelaySocket(s2);
@@ -1208,12 +1368,12 @@ int ZeroDpiEngine::RelaySockets(SOCKET s1, SOCKET s2) {
     shutdown(s1, SD_BOTH);
     shutdown(s2, SD_BOTH);
     if (hThread) {
-        if (WaitForSingleObject(hThread, 1500) == WAIT_TIMEOUT) {
+        if (WaitForSingleObject(hThread, 150) == WAIT_TIMEOUT) {
             closesocket(s1);
             closesocket(s2);
             s1 = INVALID_SOCKET;
             s2 = INVALID_SOCKET;
-            WaitForSingleObject(hThread, 2000);
+            WaitForSingleObject(hThread, 1500);
         }
         CloseHandle(hThread);
     }
@@ -1243,14 +1403,20 @@ static int RecvCompleteTlsPayload(SOCKET sock, uint8_t* buf, int maxCap) {
 
 void ZeroDpiEngine::HandleHttpClient(SOCKET clientSock) {
     DWORD timeout = 8000;
+    BOOL noDelay = TRUE;
     setsockopt(clientSock, SOL_SOCKET, SO_RCVTIMEO, (const char*)&timeout, sizeof(timeout));
+    setsockopt(clientSock, IPPROTO_TCP, TCP_NODELAY, (const char*)&noDelay, sizeof(noDelay));
 
     char reqBuf[8192];
     int n = recv(clientSock, reqBuf, sizeof(reqBuf) - 1, 0);
     if (n <= 0) { closesocket(clientSock); return; }
     reqBuf[n] = '\0';
 
-    if (strncmp(reqBuf, "GET /pac", 8) == 0 || strncmp(reqBuf, "GET /proxy.pac", 14) == 0) {
+    const char* firstLineEnd = strstr(reqBuf, "\r\n");
+    size_t firstLineLen = firstLineEnd ? (size_t)(firstLineEnd - reqBuf) : (size_t)n;
+    std::string firstLine(reqBuf, firstLineLen);
+    if (strncmp(reqBuf, "GET /pac", 8) == 0 || strncmp(reqBuf, "GET /proxy.pac", 14) == 0 ||
+        ( _strnicmp(reqBuf, "GET ", 4) == 0 && firstLine.find("/proxy.pac") != std::string::npos )) {
         ServePacFile(clientSock);
         closesocket(clientSock);
         return;
@@ -1278,10 +1444,8 @@ void ZeroDpiEngine::HandleHttpClient(SOCKET clientSock) {
         int firstLen = RecvCompleteTlsPayload(clientSock, firstPayload, sizeof(firstPayload));
         if (firstLen <= 0) { closesocket(clientSock); return; }
 
-        std::wstring clientFullPath, clientExeName, matchReason;
-        GetSocketOwnerProcess(clientSock, clientFullPath, clientExeName);
-
-        bool shouldBypass = ShouldBypassConnection(host, clientFullPath, clientExeName, matchReason);
+        std::wstring clientExeName, matchReason;
+        bool shouldBypass = ResolveBypassDecisionFast(clientSock, host, clientExeName, matchReason);
         BypassStage usedStage = shouldBypass ? (BypassStage)m_activeStage.load() : STAGE_0_DIRECT;
 
         SOCKET remoteSock = ConnectToTarget(host, port, usedStage);
@@ -1345,7 +1509,9 @@ void ZeroDpiEngine::HandleHttpClient(SOCKET clientSock) {
 
 void ZeroDpiEngine::HandleSocks5Client(SOCKET clientSock) {
     DWORD timeout = 8000;
+    BOOL noDelay = TRUE;
     setsockopt(clientSock, SOL_SOCKET, SO_RCVTIMEO, (const char*)&timeout, sizeof(timeout));
+    setsockopt(clientSock, IPPROTO_TCP, TCP_NODELAY, (const char*)&noDelay, sizeof(noDelay));
 
     uint8_t buf[512];
     int n = recv(clientSock, (char*)buf, 2, 0);
@@ -1406,10 +1572,8 @@ void ZeroDpiEngine::HandleSocks5Client(SOCKET clientSock) {
         }
     }
 
-    std::wstring clientFullPath, clientExeName, matchReason;
-    GetSocketOwnerProcess(clientSock, clientFullPath, clientExeName);
-
-    bool shouldBypass = ShouldBypassConnection(host, clientFullPath, clientExeName, matchReason);
+    std::wstring clientExeName, matchReason;
+    bool shouldBypass = ResolveBypassDecisionFast(clientSock, host, clientExeName, matchReason);
     BypassStage usedStage = shouldBypass ? (BypassStage)m_activeStage.load() : STAGE_0_DIRECT;
 
     SOCKET remoteSock = ConnectToTarget(host, port, usedStage);
@@ -1505,7 +1669,7 @@ DWORD WINAPI ZeroDpiEngine::SocksAcceptThreadProc(LPVOID param) {
     return 0;
 }
 
-static void TerminateProcessesByName(const wchar_t* exeName);
+static void TerminateProcessesByName(const wchar_t* exeName, const wchar_t* requiredPathSubstr = nullptr);
 static std::wstring FindLatestSquirrelAppExe(const std::wstring& baseFolder, const wchar_t* exeName);
 
 static void RescueStuckStartupDiscord(uint16_t httpPort) {
@@ -1567,8 +1731,8 @@ static void RescueStuckStartupDiscord(uint16_t httpPort) {
     std::wstring discordExe = FindLatestSquirrelAppExe(discordBase, L"Discord.exe");
     if (discordExe.empty()) return;
 
-    TerminateProcessesByName(L"Update.exe");
-    TerminateProcessesByName(L"Discord.exe");
+    TerminateProcessesByName(L"Update.exe", L"\\Discord\\");
+    TerminateProcessesByName(L"Discord.exe", L"\\Discord\\");
     Sleep(250);
 
     SetEnvironmentVariableW(L"HTTP_PROXY", NULL);
@@ -1707,6 +1871,23 @@ static DWORD WINAPI NotifyWinInetRefreshThread(LPVOID) {
     return 0;
 }
 
+struct YuziPerConnOptionW {
+    DWORD dwOption;
+    union {
+        DWORD    dwValue;
+        LPWSTR   pszValue;
+        FILETIME ftValue;
+    } Value;
+};
+
+struct YuziPerConnOptionListW {
+    DWORD               dwSize;
+    LPWSTR              pszConnection;
+    DWORD               dwOptionCount;
+    DWORD               dwOptionError;
+    YuziPerConnOptionW* pOptions;
+};
+
 bool ZeroDpiEngine::EnableSystemSmartPac(bool enable) {
     HKEY hKey = NULL;
     if (RegOpenKeyExW(HKEY_CURRENT_USER,
@@ -1716,16 +1897,17 @@ bool ZeroDpiEngine::EnableSystemSmartPac(bool enable) {
     }
 
     if (enable) {
-        // Discord'un Rust tabanlı güncelleyicisi (reqwest), Update.exe ve masaüstü uygulamaları
-        // doğrudan ProxyEnable=1 ve ProxyServer değerine bakar.
-        // AutoConfigURL silinerek WinHTTP/WinInet'in ilk açılışta PAC indirme gecikmesi yaşaması
-        // ve "Checking for updates..." ekranında DIRECT kaçırması %100 engellenir.
+        int scope = m_scopeMode.load();
         DWORD proxyEnable = 1;
         wchar_t proxyServer[64];
         _snwprintf_s(proxyServer, _countof(proxyServer), _TRUNCATE, L"127.0.0.1:%u", m_httpPort);
 
+        uint32_t ver = m_pacVersion.fetch_add(1) + 1;
+        wchar_t pacUrl[128];
+        _snwprintf_s(pacUrl, _countof(pacUrl), _TRUNCATE, L"http://127.0.0.1:%u/proxy.pac?v=%u", m_httpPort, ver);
+
         std::wstring proxyOverride = L"localhost;127.*;192.168.*;10.*;172.16.*;<local>";
-        if (m_scopeMode.load() == SCOPE_ALL_EXCEPT_EXCLUDED) {
+        if (scope == SCOPE_ALL_EXCEPT_EXCLUDED) {
             std::vector<TunnelTargetItem> items = GetTunnelItems();
             for (const auto& it : items) {
                 if (!it.isExcluded || !it.enabled || it.type != ITEM_DOMAIN || it.pathOrDomain.empty()) continue;
@@ -1739,13 +1921,54 @@ bool ZeroDpiEngine::EnableSystemSmartPac(bool enable) {
         RegSetValueExW(hKey, L"ProxyEnable", 0, REG_DWORD, (const BYTE*)&proxyEnable, sizeof(proxyEnable));
         RegSetValueExW(hKey, L"ProxyServer", 0, REG_SZ, (const BYTE*)proxyServer, (DWORD)((wcslen(proxyServer) + 1) * sizeof(wchar_t)));
         RegSetValueExW(hKey, L"ProxyOverride", 0, REG_SZ, (const BYTE*)proxyOverride.c_str(), (DWORD)((proxyOverride.size() + 1) * sizeof(wchar_t)));
-        RegDeleteValueW(hKey, L"AutoConfigURL");
+        if (scope == SCOPE_FULL_SYSTEM) {
+            RegDeleteValueW(hKey, L"AutoConfigURL");
+        } else {
+            RegSetValueExW(hKey, L"AutoConfigURL", 0, REG_SZ, (const BYTE*)pacUrl, (DWORD)((wcslen(pacUrl) + 1) * sizeof(wchar_t)));
+        }
+
+        YuziPerConnOptionW opts[4]{};
+        opts[0].dwOption = INTERNET_PER_CONN_FLAGS;
+        opts[0].Value.dwValue = (scope == SCOPE_FULL_SYSTEM)
+            ? (PROXY_TYPE_DIRECT | PROXY_TYPE_PROXY)
+            : (PROXY_TYPE_DIRECT | PROXY_TYPE_AUTO_PROXY_URL | PROXY_TYPE_PROXY);
+        opts[1].dwOption = INTERNET_PER_CONN_PROXY_SERVER;
+        opts[1].Value.pszValue = proxyServer;
+        opts[2].dwOption = INTERNET_PER_CONN_PROXY_BYPASS;
+        opts[2].Value.pszValue = (LPWSTR)proxyOverride.c_str();
+        opts[3].dwOption = INTERNET_PER_CONN_AUTOCONFIG_URL;
+        opts[3].Value.pszValue = (scope == SCOPE_FULL_SYSTEM) ? (LPWSTR)L"" : pacUrl;
+
+        YuziPerConnOptionListW list{};
+        list.dwSize = sizeof(list);
+        list.pszConnection = NULL;
+        list.dwOptionCount = 4;
+        list.pOptions = opts;
+        InternetSetOptionW(NULL, INTERNET_OPTION_PER_CONNECTION_OPTION, &list, sizeof(list));
     } else {
         DWORD proxyEnable = 0;
         RegSetValueExW(hKey, L"ProxyEnable", 0, REG_DWORD, (const BYTE*)&proxyEnable, sizeof(proxyEnable));
         RegDeleteValueW(hKey, L"ProxyServer");
         RegDeleteValueW(hKey, L"AutoConfigURL");
         RegDeleteValueW(hKey, L"ProxyOverride");
+
+        wchar_t emptyStr[] = L"";
+        YuziPerConnOptionW opts[4]{};
+        opts[0].dwOption = INTERNET_PER_CONN_FLAGS;
+        opts[0].Value.dwValue = PROXY_TYPE_DIRECT;
+        opts[1].dwOption = INTERNET_PER_CONN_PROXY_SERVER;
+        opts[1].Value.pszValue = emptyStr;
+        opts[2].dwOption = INTERNET_PER_CONN_PROXY_BYPASS;
+        opts[2].Value.pszValue = emptyStr;
+        opts[3].dwOption = INTERNET_PER_CONN_AUTOCONFIG_URL;
+        opts[3].Value.pszValue = emptyStr;
+
+        YuziPerConnOptionListW list{};
+        list.dwSize = sizeof(list);
+        list.pszConnection = NULL;
+        list.dwOptionCount = 4;
+        list.pOptions = opts;
+        InternetSetOptionW(NULL, INTERNET_OPTION_PER_CONNECTION_OPTION, &list, sizeof(list));
     }
 
     RegCloseKey(hKey);
@@ -1757,9 +1980,15 @@ bool ZeroDpiEngine::EnableSystemSmartPac(bool enable) {
     return true;
 }
 
-static void TerminateProcessesByName(const wchar_t* exeName) {
+static void TerminateProcessesByName(const wchar_t* exeName, const wchar_t* requiredPathSubstr) {
     HANDLE hSnap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
     if (hSnap == INVALID_HANDLE_VALUE) return;
+
+    std::wstring reqLower;
+    if (requiredPathSubstr && requiredPathSubstr[0] != L'\0') {
+        reqLower = requiredPathSubstr;
+        for (wchar_t& c : reqLower) c = (wchar_t)towlower(c);
+    }
 
     std::vector<HANDLE> waitHandles;
     PROCESSENTRY32W pe{};
@@ -1767,6 +1996,21 @@ static void TerminateProcessesByName(const wchar_t* exeName) {
     if (Process32FirstW(hSnap, &pe)) {
         do {
             if (_wcsicmp(pe.szExeFile, exeName) == 0) {
+                if (!reqLower.empty()) {
+                    HANDLE hQuery = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pe.th32ProcessID);
+                    if (!hQuery) continue;
+                    wchar_t imgBuf[MAX_PATH] = {0};
+                    DWORD imgLen = MAX_PATH;
+                    bool matched = false;
+                    if (QueryFullProcessImageNameW(hQuery, 0, imgBuf, &imgLen) && imgLen > 0) {
+                        std::wstring imgLower(imgBuf, imgLen);
+                        for (wchar_t& c : imgLower) c = (wchar_t)towlower(c);
+                        matched = (imgLower.find(reqLower) != std::wstring::npos);
+                    }
+                    CloseHandle(hQuery);
+                    if (!matched) continue;
+                }
+
                 HANDLE hProc = OpenProcess(PROCESS_TERMINATE | SYNCHRONIZE, FALSE, pe.th32ProcessID);
                 if (!hProc) {
                     hProc = OpenProcess(PROCESS_TERMINATE, FALSE, pe.th32ProcessID);
