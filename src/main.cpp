@@ -122,6 +122,9 @@ static int  g_selectedRow   = -1;
 static int  g_scrollOffsetY = 0;
 static int  g_hoverRow      = -1;
 static bool g_hoverRowDel   = false;
+static bool g_sbDragging    = false;
+static bool g_sbHover       = false;
+static int  g_sbDragGrabY   = 0;
 
 static ZeroDpiEngine g_engine;
 static NOTIFYICONDATAW g_nid{};
@@ -238,17 +241,67 @@ static void DrawFlatBadge(HDC hdc, Graphics& g, const RECT& rc, int radiusPx,
     SelectObject(hdc, oldF);
 }
 
+struct ListScrollbarMetrics {
+    RECT rcView;
+    RECT rcClip;
+    RECT rcTrackHit;
+    int  rowH;
+    int  viewH;
+    int  totalH;
+    int  maxScroll;
+    int  rightMargin;
+    int  trackTop;
+    int  trackH;
+    int  thumbTop;
+    int  thumbH;
+    int  thumbTravel;
+    bool hasScrollbar;
+};
+
+static ListScrollbarMetrics ComputeListScrollbarMetrics() {
+    ListScrollbarMetrics m{};
+    m.rcView = GetListViewportRect();
+    int pad = S(4);
+    m.rcClip = { m.rcView.left + pad, m.rcView.top + pad, m.rcView.right - pad, m.rcView.bottom - pad };
+    m.rowH = GetRowHeightPx();
+    m.viewH = m.rcClip.bottom - m.rcClip.top;
+    m.totalH = (int)g_visibleRows.size() * m.rowH;
+    m.hasScrollbar = (m.totalH > m.viewH);
+    m.maxScroll = m.hasScrollbar ? (m.totalH - m.viewH) : 0;
+    m.rightMargin = m.hasScrollbar ? S(14) : S(2);
+
+    m.trackTop = m.rcClip.top + S(2);
+    m.trackH = m.viewH - S(4);
+    if (m.trackH < 1) m.trackH = 1;
+
+    if (m.hasScrollbar) {
+        m.thumbH = (int)((REAL)m.trackH * ((REAL)m.viewH / (REAL)m.totalH));
+        if (m.thumbH < S(26)) m.thumbH = S(26);
+        if (m.thumbH > m.trackH) m.thumbH = m.trackH;
+        m.thumbTravel = m.trackH - m.thumbH;
+        int clampedScroll = g_scrollOffsetY;
+        if (clampedScroll < 0) clampedScroll = 0;
+        if (clampedScroll > m.maxScroll) clampedScroll = m.maxScroll;
+        m.thumbTop = m.trackTop + ((m.maxScroll > 0 && m.thumbTravel > 0)
+            ? (int)(((REAL)clampedScroll / (REAL)m.maxScroll) * (REAL)m.thumbTravel + 0.5f)
+            : 0);
+        m.rcTrackHit = { m.rcClip.right - S(14), m.rcClip.top, m.rcView.right, m.rcClip.bottom };
+    }
+    return m;
+}
+
 static void ClampListScroll() {
-    RECT rcView = GetListViewportRect();
-    int viewH = (rcView.bottom - rcView.top) - S(12);
-    int contentH = (int)g_visibleRows.size() * GetRowHeightPx();
-    int maxScroll = contentH - viewH;
-    if (maxScroll < 0) maxScroll = 0;
+    ListScrollbarMetrics m = ComputeListScrollbarMetrics();
     if (g_scrollOffsetY < 0) g_scrollOffsetY = 0;
-    if (g_scrollOffsetY > maxScroll) g_scrollOffsetY = maxScroll;
+    if (g_scrollOffsetY > m.maxScroll) g_scrollOffsetY = m.maxScroll;
 }
 
 static void RefreshTargetsListView() {
+    if (g_sbDragging) {
+        g_sbDragging = false;
+        if (g_hMainWnd && GetCapture() == g_hMainWnd) ReleaseCapture();
+    }
+    g_sbHover = false;
     TunnelScopeMode scope = g_engine.GetScopeMode();
 
     bool showListControls = (scope != SCOPE_FULL_SYSTEM);
@@ -659,11 +712,10 @@ static void PaintCustomGlassTargetList(HDC hdc, Graphics& g) {
     g.GetClip(&prevRegion);
     g.SetClip(Rect(rcClip.left, rcClip.top, rcClip.right - rcClip.left, rcClip.bottom - rcClip.top), CombineModeIntersect);
 
-    int rowH = GetRowHeightPx();
-    int viewH = rcClip.bottom - rcClip.top;
-    int totalH = (int)g_visibleRows.size() * rowH;
-    bool hasScrollbar = (totalH > viewH);
-    int rightMargin = hasScrollbar ? S(10) : S(2);
+    ListScrollbarMetrics sb = ComputeListScrollbarMetrics();
+    int rowH = sb.rowH;
+    bool hasScrollbar = sb.hasScrollbar;
+    int rightMargin = sb.rightMargin;
 
     HGDIOBJ oldF = SelectObject(hdc, g_hFontNormal);
 
@@ -730,19 +782,21 @@ static void PaintCustomGlassTargetList(HDC hdc, Graphics& g) {
     }
 
     if (hasScrollbar) {
-        REAL sbW = (REAL)S(4);
-        REAL sbX = (REAL)(rcClip.right - S(6));
-        REAL sbTop = (REAL)(rcClip.top + S(2));
-        REAL sbTrackH = (REAL)(viewH - S(4));
+        bool hotSb = (g_sbHover || g_sbDragging);
+        REAL sbW = (REAL)(hotSb ? S(6) : S(5));
+        REAL sbX = (REAL)(rcClip.right - S(2)) - sbW;
 
-        REAL thumbH = sbTrackH * ((REAL)viewH / (REAL)totalH);
-        if (thumbH < (REAL)S(24)) thumbH = (REAL)S(24);
-        int maxScroll = totalH - viewH;
-        REAL thumbY = sbTop + ((maxScroll > 0) ? ((REAL)g_scrollOffsetY / (REAL)maxScroll) * (sbTrackH - thumbH) : 0.0f);
+        if (hotSb) {
+            GraphicsPath trkPath;
+            BuildRoundRectPath(trkPath, sbX, (REAL)sb.trackTop, sbW, (REAL)sb.trackH, sbW * 0.5f);
+            SolidBrush trkBr(ToGdipColor(CTP_BASE));
+            g.FillPath(&trkBr, &trkPath);
+        }
 
         GraphicsPath thPath;
-        BuildRoundRectPath(thPath, sbX, thumbY, sbW, thumbH, 2.0f);
-        SolidBrush thBr(ToGdipColor(CTP_SURFACE1));
+        BuildRoundRectPath(thPath, sbX, (REAL)sb.thumbTop, sbW, (REAL)sb.thumbH, sbW * 0.5f);
+        COLORREF thumbCol = g_sbDragging ? CTP_MAUVE : (g_sbHover ? CTP_OVERLAY0 : CTP_SURFACE1);
+        SolidBrush thBr(ToGdipColor(thumbCol));
         g.FillPath(&thBr, &thPath);
     }
 
@@ -1038,30 +1092,42 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
         case WM_MOUSEMOVE: {
             if (g_engine.GetScopeMode() != SCOPE_FULL_SYSTEM && !g_visibleRows.empty()) {
                 POINT pt = { GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam) };
-                RECT rcView = GetListViewportRect();
-                int pad = S(4);
-                RECT rcClip = { rcView.left + pad, rcView.top + pad, rcView.right - pad, rcView.bottom - pad };
+                ListScrollbarMetrics sb = ComputeListScrollbarMetrics();
 
+                if (g_sbDragging) {
+                    if (sb.hasScrollbar && sb.thumbTravel > 0) {
+                        int newThumbTop = pt.y - g_sbDragGrabY;
+                        if (newThumbTop < sb.trackTop) newThumbTop = sb.trackTop;
+                        if (newThumbTop > sb.trackTop + sb.thumbTravel) newThumbTop = sb.trackTop + sb.thumbTravel;
+                        int newScroll = (int)(((REAL)(newThumbTop - sb.trackTop) / (REAL)sb.thumbTravel) * (REAL)sb.maxScroll + 0.5f);
+                        if (newScroll != g_scrollOffsetY) {
+                            g_scrollOffsetY = newScroll;
+                            ClampListScroll();
+                            InvalidateRect(hwnd, &sb.rcView, FALSE);
+                        }
+                    }
+                    return 0;
+                }
+
+                bool newSbHover = (sb.hasScrollbar && PtInRect(&sb.rcTrackHit, pt));
                 int newHover = -1;
                 bool newHoverDel = false;
-                if (PtInRect(&rcClip, pt)) {
-                    int relY = pt.y - rcClip.top + g_scrollOffsetY;
-                    int idx = relY / GetRowHeightPx();
+                if (!newSbHover && PtInRect(&sb.rcClip, pt)) {
+                    int relY = pt.y - sb.rcClip.top + g_scrollOffsetY;
+                    int idx = relY / sb.rowH;
                     if (idx >= 0 && idx < (int)g_visibleRows.size()) {
                         newHover = idx;
-                        int viewH = rcClip.bottom - rcClip.top;
-                        int totalH = (int)g_visibleRows.size() * GetRowHeightPx();
-                        int rightMargin = (totalH > viewH) ? S(10) : S(2);
-                        int rowRight = rcClip.right - rightMargin - S(2);
+                        int rowRight = sb.rcClip.right - sb.rightMargin - S(2);
                         if (pt.x >= rowRight - S(26) && pt.x <= rowRight - S(2)) {
                             newHoverDel = true;
                         }
                     }
                 }
-                if (newHover != g_hoverRow || newHoverDel != g_hoverRowDel) {
+                if (newHover != g_hoverRow || newHoverDel != g_hoverRowDel || newSbHover != g_sbHover) {
                     g_hoverRow = newHover;
                     g_hoverRowDel = newHoverDel;
-                    InvalidateRect(hwnd, &rcView, FALSE);
+                    g_sbHover = newSbHover;
+                    InvalidateRect(hwnd, &sb.rcView, FALSE);
                 }
             }
             return 0;
@@ -1070,18 +1136,36 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
         case WM_LBUTTONDOWN: {
             if (g_engine.GetScopeMode() != SCOPE_FULL_SYSTEM && !g_visibleRows.empty()) {
                 POINT pt = { GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam) };
-                RECT rcView = GetListViewportRect();
-                int pad = S(4);
-                RECT rcClip = { rcView.left + pad, rcView.top + pad, rcView.right - pad, rcView.bottom - pad };
+                ListScrollbarMetrics sb = ComputeListScrollbarMetrics();
 
-                if (PtInRect(&rcClip, pt)) {
-                    int relY = pt.y - rcClip.top + g_scrollOffsetY;
-                    int idx = relY / GetRowHeightPx();
+                if (sb.hasScrollbar && PtInRect(&sb.rcTrackHit, pt)) {
+                    g_sbDragging = true;
+                    g_sbHover = true;
+                    g_hoverRow = -1;
+                    g_hoverRowDel = false;
+                    SetCapture(hwnd);
+
+                    if (pt.y >= sb.thumbTop && pt.y <= sb.thumbTop + sb.thumbH) {
+                        g_sbDragGrabY = pt.y - sb.thumbTop;
+                    } else {
+                        g_sbDragGrabY = sb.thumbH / 2;
+                        if (sb.thumbTravel > 0) {
+                            int newThumbTop = pt.y - g_sbDragGrabY;
+                            if (newThumbTop < sb.trackTop) newThumbTop = sb.trackTop;
+                            if (newThumbTop > sb.trackTop + sb.thumbTravel) newThumbTop = sb.trackTop + sb.thumbTravel;
+                            g_scrollOffsetY = (int)(((REAL)(newThumbTop - sb.trackTop) / (REAL)sb.thumbTravel) * (REAL)sb.maxScroll + 0.5f);
+                            ClampListScroll();
+                        }
+                    }
+                    InvalidateRect(hwnd, &sb.rcView, FALSE);
+                    return 0;
+                }
+
+                if (PtInRect(&sb.rcClip, pt)) {
+                    int relY = pt.y - sb.rcClip.top + g_scrollOffsetY;
+                    int idx = relY / sb.rowH;
                     if (idx >= 0 && idx < (int)g_visibleRows.size()) {
-                        int viewH = rcClip.bottom - rcClip.top;
-                        int totalH = (int)g_visibleRows.size() * GetRowHeightPx();
-                        int rightMargin = (totalH > viewH) ? S(10) : S(2);
-                        int rowRight = rcClip.right - rightMargin - S(2);
+                        int rowRight = sb.rcClip.right - sb.rightMargin - S(2);
 
                         if (pt.x >= rowRight - S(26) && pt.x <= rowRight - S(2)) {
                             int engIdx = g_visibleRows[idx].engineIndex;
@@ -1090,10 +1174,29 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
                             SaveCurrentUiSettings();
                         } else {
                             g_selectedRow = idx;
-                            InvalidateRect(hwnd, &rcView, FALSE);
+                            InvalidateRect(hwnd, &sb.rcView, FALSE);
                         }
                     }
                 }
+            }
+            return 0;
+        }
+
+        case WM_LBUTTONUP: {
+            if (g_sbDragging) {
+                g_sbDragging = false;
+                if (GetCapture() == hwnd) ReleaseCapture();
+                RECT rcView = GetListViewportRect();
+                InvalidateRect(hwnd, &rcView, FALSE);
+            }
+            return 0;
+        }
+
+        case WM_CAPTURECHANGED: {
+            if (g_sbDragging) {
+                g_sbDragging = false;
+                RECT rcView = GetListViewportRect();
+                InvalidateRect(hwnd, &rcView, FALSE);
             }
             return 0;
         }
