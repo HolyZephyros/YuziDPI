@@ -105,6 +105,7 @@ public:
     // Kademe seçimi (1..6 = Manuel Kademe, varsayılan 1) — Çalışırken anında geçiş yapar
     void SetSelectedMode(int mode);
     void ApplyLiveSwitch(bool stageChanged = false);
+    void OnSystemResume();
     int GetSelectedMode() const { return m_selectedMode.load(); }
     BypassStage GetActiveStage() const { return (BypassStage)m_activeStage.load(); }
     int GetLastDiscoveryLatency() const { return m_lastLatencyMs.load(); }

@@ -1129,17 +1129,11 @@ SOCKET ZeroDpiEngine::ConnectViaUpstreamSocks5(const std::string& targetHost, ui
 }
 
 bool ZeroDpiEngine::ProbeDomainAtStage(const std::string& host, uint16_t port, BypassStage stage, int& outLatencyMs) {
-    DWORD t0 = GetTickCount();
+    ULONGLONG t0 = GetTickCount64();
 
-    SOCKET s = INVALID_SOCKET;
-    if (stage == STAGE_6_UPSTREAM_TUNNEL) {
-        s = ConnectViaUpstreamSocks5(host, port);
-    } else {
-        std::string ip = ResolveDoH(host, stage);
-        if (ip.empty()) return false;
-        s = ConnectTcpWithTimeout(ip, port, 1400);
-    }
-
+    std::string ip = ResolveDoH(host, stage);
+    if (ip.empty()) return false;
+    SOCKET s = ConnectTcpWithTimeout(ip, port, 1400);
     if (s == INVALID_SOCKET) return false;
 
     DWORD rwTimeout = 1000;
@@ -1157,7 +1151,7 @@ bool ZeroDpiEngine::ProbeDomainAtStage(const std::string& host, uint16_t port, B
     closesocket(s);
 
     if (r >= 10 && resp[0] == 0x16 && resp[1] == 0x03 && resp[5] == 0x02) {
-        outLatencyMs = (int)(GetTickCount() - t0);
+        outLatencyMs = (int)(GetTickCount64() - t0);
         if (outLatencyMs <= 0) outLatencyMs = 1;
         return true;
     }
@@ -1616,8 +1610,11 @@ static SOCKET CreateLocalListenSocket(uint16_t port) {
     SOCKET s = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
     if (s == INVALID_SOCKET) return INVALID_SOCKET;
 
-    BOOL reuse = TRUE;
-    setsockopt(s, SOL_SOCKET, SO_REUSEADDR, (const char*)&reuse, sizeof(reuse));
+#ifndef SO_EXCLUSIVEADDRUSE
+#define SO_EXCLUSIVEADDRUSE ((int)(~SO_REUSEADDR))
+#endif
+    BOOL excl = TRUE;
+    setsockopt(s, SOL_SOCKET, SO_EXCLUSIVEADDRUSE, (const char*)&excl, sizeof(excl));
 
     sockaddr_in addr{};
     addr.sin_family = AF_INET;
@@ -1788,21 +1785,57 @@ DWORD WINAPI ZeroDpiEngine::StartupWorkerThreadProc(LPVOID param) {
     return 0;
 }
 
+void ZeroDpiEngine::OnSystemResume() {
+    std::vector<SOCKET> staleSocks;
+    {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        m_dohCache.clear();
+        m_domainStageCache.clear();
+        staleSocks = m_activeRelaySocks;
+    }
+    if (m_running.load()) {
+        for (SOCKET s : staleSocks) {
+            if (s != INVALID_SOCKET) {
+                shutdown(s, SD_BOTH);
+            }
+        }
+        EnableSystemSmartPac(true);
+    }
+}
+
 bool ZeroDpiEngine::Start(uint16_t httpPort, uint16_t socksPort) {
     if (m_running.load()) return true;
 
-    m_httpPort = httpPort;
-    m_socksPort = socksPort;
+    m_httpListenSock = INVALID_SOCKET;
+    m_socksListenSock = INVALID_SOCKET;
 
-    m_httpListenSock = CreateLocalListenSocket(m_httpPort);
-    m_socksListenSock = CreateLocalListenSocket(m_socksPort);
+    for (uint16_t offset = 0; offset < 25; ++offset) {
+        uint16_t cand = (uint16_t)(httpPort + offset);
+        SOCKET s = CreateLocalListenSocket(cand);
+        if (s != INVALID_SOCKET) {
+            m_httpListenSock = s;
+            m_httpPort = cand;
+            break;
+        }
+    }
+
+    for (uint16_t offset = 0; offset < 25; ++offset) {
+        uint16_t cand = (uint16_t)(socksPort + offset);
+        if (cand == m_httpPort) continue;
+        SOCKET s = CreateLocalListenSocket(cand);
+        if (s != INVALID_SOCKET) {
+            m_socksListenSock = s;
+            m_socksPort = cand;
+            break;
+        }
+    }
 
     if (m_httpListenSock == INVALID_SOCKET || m_socksListenSock == INVALID_SOCKET) {
         if (m_httpListenSock != INVALID_SOCKET) closesocket(m_httpListenSock);
         if (m_socksListenSock != INVALID_SOCKET) closesocket(m_socksListenSock);
         m_httpListenSock = INVALID_SOCKET;
         m_socksListenSock = INVALID_SOCKET;
-        Log(L"[!] Hata: Yerel portlar (%u / %u) kullanımda!", m_httpPort, m_socksPort);
+        Log(L"[!] Hata: Yerel portlar (%u / %u) kullanımda!", httpPort, socksPort);
         return false;
     }
 

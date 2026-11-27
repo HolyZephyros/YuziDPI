@@ -178,11 +178,29 @@ static double GetCurrentRamMb() {
 static std::wstring GetConfigIniPath() {
     wchar_t exePath[MAX_PATH] = {0};
     GetModuleFileNameW(NULL, exePath, MAX_PATH);
-    std::wstring path(exePath);
-    size_t pos = path.find_last_of(L"\\/");
-    if (pos != std::wstring::npos) path.resize(pos + 1);
-    path += L"yuzidpi.ini";
-    return path;
+    std::wstring exeDir(exePath);
+    size_t pos = exeDir.find_last_of(L"\\/");
+    if (pos != std::wstring::npos) exeDir.resize(pos + 1);
+    std::wstring legacyIni = exeDir + L"yuzidpi.ini";
+
+    wchar_t appData[MAX_PATH] = {0};
+    if (GetEnvironmentVariableW(L"APPDATA", appData, MAX_PATH) > 0) {
+        std::wstring cfgDir = std::wstring(appData) + L"\\YuziDPI";
+        CreateDirectoryW(cfgDir.c_str(), NULL);
+        std::wstring appDataIni = cfgDir + L"\\yuzidpi.ini";
+
+        bool hasAppData = (GetFileAttributesW(appDataIni.c_str()) != INVALID_FILE_ATTRIBUTES);
+        bool hasLegacy  = (GetFileAttributesW(legacyIni.c_str()) != INVALID_FILE_ATTRIBUTES);
+        if (!hasAppData && hasLegacy) {
+            if (!MoveFileExW(legacyIni.c_str(), appDataIni.c_str(), MOVEFILE_COPY_ALLOWED)) {
+                if (CopyFileW(legacyIni.c_str(), appDataIni.c_str(), FALSE)) {
+                    DeleteFileW(legacyIni.c_str());
+                }
+            }
+        }
+        return appDataIni;
+    }
+    return legacyIni;
 }
 
 static void OnEngineLog(const wchar_t* msg) {
@@ -1174,6 +1192,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
                             SaveCurrentUiSettings();
                         } else {
                             g_selectedRow = idx;
+                            SetFocus(hwnd);
                             InvalidateRect(hwnd, &sb.rcView, FALSE);
                         }
                     }
@@ -1388,16 +1407,26 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
             DestroyWindow(hwnd);
             return 0;
 
-        case WM_QUERYENDSESSION:
-        case WM_ENDSESSION:
-            g_engine.SetCallbacks(nullptr, nullptr);
-            g_engine.Stop();
-            g_engine.EnableSystemSmartPac(false);
-            if (g_nid.hWnd) {
-                Shell_NotifyIconW(NIM_DELETE, &g_nid);
-                g_nid.hWnd = NULL;
+        case WM_POWERBROADCAST:
+            if (wParam == PBT_APMRESUMEAUTOMATIC || wParam == PBT_APMRESUMESUSPEND) {
+                g_engine.OnSystemResume();
             }
             return TRUE;
+
+        case WM_QUERYENDSESSION:
+            return TRUE;
+
+        case WM_ENDSESSION:
+            if (wParam != FALSE) {
+                g_engine.SetCallbacks(nullptr, nullptr);
+                g_engine.Stop();
+                g_engine.EnableSystemSmartPac(false);
+                if (g_nid.hWnd) {
+                    Shell_NotifyIconW(NIM_DELETE, &g_nid);
+                    g_nid.hWnd = NULL;
+                }
+            }
+            return 0;
 
         case WM_DESTROY:
             g_hMainWnd = NULL;
@@ -1543,6 +1572,18 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, LPWSTR lpCmdLine, int) {
 
     MSG msg{};
     while (GetMessageW(&msg, NULL, 0, 0)) {
+        if (msg.message == WM_KEYDOWN) {
+            if (msg.wParam == VK_RETURN && GetFocus() == g_hEditDomain) {
+                SendMessageW(g_hMainWnd, WM_COMMAND, ID_BTN_ADD_DOMAIN, 0);
+                continue;
+            }
+            if (msg.wParam == VK_DELETE && GetFocus() != g_hEditDomain &&
+                g_engine.GetScopeMode() != SCOPE_FULL_SYSTEM &&
+                g_selectedRow >= 0 && g_selectedRow < (int)g_visibleRows.size()) {
+                SendMessageW(g_hMainWnd, WM_COMMAND, ID_BTN_REMOVE, 0);
+                continue;
+            }
+        }
         if (!IsDialogMessageW(g_hMainWnd, &msg)) {
             TranslateMessage(&msg);
             DispatchMessageW(&msg);
