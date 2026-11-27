@@ -39,6 +39,7 @@ using namespace Gdiplus;
 #define ID_CHK_WINSTART   132
 #define ID_CHK_MINSTART   133
 #define ID_BTN_LANG       140
+#define ID_BTN_UPDATE     141
 
 #define ID_BTN_ADD_EXE    202
 #define ID_BTN_ADD_FOLDER 203
@@ -75,6 +76,7 @@ using namespace Gdiplus;
 
 static HWND g_hMainWnd        = NULL;
 static HWND g_hBtnLang        = NULL;
+static HWND g_hBtnUpdate      = NULL;
 static HWND g_hScopeTabs[3]   = { NULL, NULL, NULL };
 static HWND g_hStageBtns[6]   = { NULL, NULL, NULL, NULL, NULL, NULL };
 static HWND g_hChkAutoConn    = NULL;
@@ -192,11 +194,7 @@ static std::wstring GetConfigIniPath() {
         bool hasAppData = (GetFileAttributesW(appDataIni.c_str()) != INVALID_FILE_ATTRIBUTES);
         bool hasLegacy  = (GetFileAttributesW(legacyIni.c_str()) != INVALID_FILE_ATTRIBUTES);
         if (!hasAppData && hasLegacy) {
-            if (!MoveFileExW(legacyIni.c_str(), appDataIni.c_str(), MOVEFILE_COPY_ALLOWED)) {
-                if (CopyFileW(legacyIni.c_str(), appDataIni.c_str(), FALSE)) {
-                    DeleteFileW(legacyIni.c_str());
-                }
-            }
+            CopyFileW(legacyIni.c_str(), appDataIni.c_str(), FALSE);
         }
         return appDataIni;
     }
@@ -502,8 +500,8 @@ static void DrawNeumorphicControl(LPDRAWITEMSTRUCT dis) {
     HBITMAP hbm = CreateCompatibleBitmap(hdcOut, w, h);
     HGDIOBJ oldBm = SelectObject(hdc, hbm);
 
-    // Üst bardaki dil seçici Mantle (#181825) üzerinde, diğer butonlar Base (#1E1E2E) kart üzerinde
-    FillRect(hdc, &rc, (id == ID_BTN_LANG) ? g_hBrMantle : g_hBrBase);
+    // Üst bardaki dil seçici & güncelleme rozeti Mantle (#181825) üzerinde, diğer butonlar Base (#1E1E2E) kart üzerinde
+    FillRect(hdc, &rc, (id == ID_BTN_LANG || id == ID_BTN_UPDATE) ? g_hBrMantle : g_hBrBase);
 
     Graphics g(hdc);
     g.SetSmoothingMode(SmoothingModeAntiAlias);
@@ -518,6 +516,26 @@ static void DrawNeumorphicControl(LPDRAWITEMSTRUCT dis) {
         SetBkMode(hdc, TRANSPARENT);
         SetTextColor(hdc, CTP_SUBTEXT0);
         DrawTextW(hdc, langTxt, -1, &rc, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+        SelectObject(hdc, oldF);
+
+        BitBlt(hdcOut, 0, 0, w, h, hdc, 0, 0, SRCCOPY);
+        SelectObject(hdc, oldBm);
+        DeleteObject(hbm);
+        DeleteDC(hdc);
+        return;
+    }
+
+    // 0.5) ÜST BAR YENİ SÜRÜM ROZETİ (Yalnızca yeni sürüm mevcutsa görünür)
+    if (id == ID_BTN_UPDATE) {
+        DrawFlatBox(g, rc, 5, pressed ? CTP_CRUST : CTP_MAUVE_BG, CTP_MAUVE, 1.0f);
+        std::wstring updTag, updUrl;
+        GetAvailableUpdateInfo(updTag, updUrl);
+        wchar_t updTxt[48];
+        _snwprintf_s(updTxt, _countof(updTxt), _TRUNCATE, L"⬇ %s", updTag.c_str());
+        HGDIOBJ oldF = SelectObject(hdc, g_hFontSmallB);
+        SetBkMode(hdc, TRANSPARENT);
+        SetTextColor(hdc, CTP_MAUVE);
+        DrawTextW(hdc, updTxt, -1, &rc, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
         SelectObject(hdc, oldF);
 
         BitBlt(hdcOut, 0, 0, w, h, hdc, 0, 0, SRCCOPY);
@@ -964,11 +982,16 @@ static void PaintNeumorphicDashboard(HWND hwnd, HDC hdcWin) {
 static void CreateUiControls(HWND hwnd) {
     HINSTANCE hInst = GetModuleHandleW(NULL);
 
-    // 0. Üst Bar Dil Seçici Buton (19 Dil)
+    // 0. Üst Bar Dil Seçici Buton (19 Dil) + Gizli Güncelleme Rozeti
     g_hBtnLang = CreateWindowExW(0, L"BUTTON", L"TR",
         WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_OWNERDRAW,
         S(392), S(14), S(56), S(24),
         hwnd, (HMENU)ID_BTN_LANG, hInst, NULL);
+
+    g_hBtnUpdate = CreateWindowExW(0, L"BUTTON", L"",
+        WS_CHILD | WS_TABSTOP | BS_OWNERDRAW,
+        S(168), S(14), S(96), S(24),
+        hwnd, (HMENU)ID_BTN_UPDATE, hInst, NULL);
 
     // 1. Çalışma Kapsamı — 3 Mat Kutu
     const wchar_t* scopeNames[3] = { L().scope0Title, L().scope1Title, L().scope2Title };
@@ -1222,62 +1245,15 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
         case WM_TIMER: {
             if (wParam == 1) {
                 KillTimer(hwnd, 1);
-                CleanupOldOtaFiles();
                 UpdateStatusUi();
             }
             return 0;
         }
 
-        case WM_OTA_RESTART: {
-            bool wasHidden  = !IsWindowVisible(hwnd);
-            bool wasRunning = g_engine.IsRunning();
-            std::wstring exePath = GetCurrentExeFullPath();
-            std::wstring oldPath = exePath + L".old";
-
-            if (wasRunning) {
-                g_engine.Stop();
-            }
-
-            bool launchedHealthy = false;
-            if (GetFileAttributesW(exePath.c_str()) != INVALID_FILE_ATTRIBUTES) {
-                wchar_t cmdLine[MAX_PATH + 32] = {0};
-                if (wasHidden) {
-                    _snwprintf_s(cmdLine, _countof(cmdLine), _TRUNCATE, L"\"%s\" --minimized", exePath.c_str());
-                } else {
-                    _snwprintf_s(cmdLine, _countof(cmdLine), _TRUNCATE, L"\"%s\"", exePath.c_str());
-                }
-                STARTUPINFOW si{};
-                si.cb = sizeof(si);
-                PROCESS_INFORMATION pi{};
-                if (CreateProcessW(NULL, cmdLine, NULL, NULL, FALSE, 0, NULL, NULL, &si, &pi)) {
-                    // Yeni sürecin anında antivirüs/hata tarafından kapatılmadığını doğrula (400 ms)
-                    DWORD waitRes = WaitForSingleObject(pi.hProcess, 400);
-                    if (waitRes == WAIT_TIMEOUT) {
-                        launchedHealthy = true;
-                    }
-                    CloseHandle(pi.hThread);
-                    CloseHandle(pi.hProcess);
-                }
-            }
-
-            if (launchedHealthy) {
-                g_engine.SetCallbacks(nullptr, nullptr);
-                if (g_nid.hWnd) {
-                    Shell_NotifyIconW(NIM_DELETE, &g_nid);
-                    g_nid.hWnd = NULL;
-                }
-                ShowWindow(hwnd, SW_HIDE);
-                DestroyWindow(hwnd);
-            } else {
-                // Yeni sürüm başlatılamadıysa (ör. antivirüs karantinası) eski .old yedeğini geri kurtar ve çalışmaya devam et!
-                DeleteFileW(exePath.c_str());
-                if (GetFileAttributesW(oldPath.c_str()) != INVALID_FILE_ATTRIBUTES) {
-                    MoveFileWithRetry(oldPath, exePath, 20, 150);
-                }
-                if (wasRunning) {
-                    g_engine.Start(3131, 1080);
-                    UpdateStatusUi();
-                }
+        case WM_OTA_AVAILABLE: {
+            if (g_hBtnUpdate) {
+                ShowWindow(g_hBtnUpdate, SW_SHOW);
+                InvalidateRect(g_hBtnUpdate, NULL, FALSE);
             }
             return 0;
         }
@@ -1308,6 +1284,14 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
 
             if (id == ID_BTN_LANG) {
                 ShowLanguagePopupMenu(hwnd);
+                return 0;
+            }
+
+            if (id == ID_BTN_UPDATE) {
+                std::wstring updTag, updUrl;
+                if (GetAvailableUpdateInfo(updTag, updUrl)) {
+                    ShellExecuteW(hwnd, L"open", updUrl.c_str(), NULL, NULL, SW_SHOWNORMAL);
+                }
                 return 0;
             }
 
@@ -1484,20 +1468,6 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, LPWSTR lpCmdLine, int) {
         BypassStage st = g_engine.RunAutoDiscovery(lat);
         printf("Discovered Stage: %d, Latency: %d ms\n", (int)st, lat);
         return (st >= STAGE_1_FAST_TLS_REC && st <= STAGE_6_UPSTREAM_TUNNEL && lat > 0) ? 0 : 1;
-    }
-
-    // Eğer az önce OTA güncellemesiyle yeniden başlatıldıysa (.old dosyası varsa),
-    // eski sürecin penceresini kapatmasını bekle ki tek-örnek (FindWindow) kontrolüne takılmasın.
-    // (.old dosyası ancak yeni pencere 800ms sağlıklı çalıştıktan sonra WM_TIMER içinde silinir.)
-    {
-        std::wstring oldFile = GetCurrentExeFullPath() + L".old";
-        if (GetFileAttributesW(oldFile.c_str()) != INVALID_FILE_ATTRIBUTES) {
-            for (int i = 0; i < 60; ++i) {
-                if (!FindWindowW(L"YuziDpiDarkLiquidGlassWnd", NULL)) break;
-                Sleep(50);
-            }
-            Sleep(100);
-        }
     }
 
     HWND hExisting = FindWindowW(L"YuziDpiDarkLiquidGlassWnd", NULL);

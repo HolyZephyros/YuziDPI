@@ -16,13 +16,12 @@ jobs:
       - name: Checkout Source
         uses: actions/checkout@v5
 
-      - name: Compile Resource and Binary (MSVC x64)
+      - name: Compile Resource and Binary (MinGW-w64)
         shell: cmd
         run: |
-          for /f "usebackq tokens=*" %%i in (`"%ProgramFiles(x86)%\Microsoft Visual Studio\Installer\vswhere.exe" -latest -property installationPath`) do set "VSDIR=%%i"
-          call "%VSDIR%\VC\Auxiliary\Build\vcvars64.bat"
-          rc.exe /nologo /I . /fo src\app.res src\app.rc
-          cl.exe /nologo /std:c++17 /utf-8 /O2 /EHsc /MT /W3 /Fe:YuziDPI.exe src\main.cpp src\dpi_engine.cpp src\app.res /link /SUBSYSTEM:WINDOWS ws2_32.lib iphlpapi.lib winhttp.lib wininet.lib dwmapi.lib gdiplus.lib gdi32.lib user32.lib shell32.lib psapi.lib advapi32.lib comctl32.lib comdlg32.lib ole32.lib uuid.lib
+          if exist "C:\msys64\mingw64\bin" set "PATH=C:\msys64\mingw64\bin;%PATH%"
+          windres src\app.rc -O coff -o src\app_res.o
+          g++ -std=c++17 -O2 -static -mwindows -municode src\main.cpp src\dpi_engine.cpp src\app_res.o -o YuziDPI.exe -lws2_32 -liphlpapi -lwinhttp -lwininet -ldwmapi -lgdiplus -lgdi32 -luser32 -lshell32 -lpsapi -ladvapi32 -lcomctl32 -lcomdlg32 -lole32 -luuid
 
       - name: Publish GitHub Release
         if: startsWith(github.ref, 'refs/tags/v')

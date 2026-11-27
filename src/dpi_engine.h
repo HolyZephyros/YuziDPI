@@ -10,7 +10,6 @@
 #include <iphlpapi.h>
 #include <winhttp.h>
 #include <psapi.h>
-#include <tlhelp32.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <string>
@@ -116,11 +115,7 @@ public:
     void RemoveTunnelItem(int index);
     std::vector<TunnelTargetItem> GetTunnelItems() const;
 
-    // Listedeki (veya seçili) uygulama/klasörü yerel tünel üzerinden başlatır
-    bool LaunchTargetItemTunneled(int index);
-    int LaunchAllAppTargetsTunneled();
-
-    // Ayarları zerodpi.ini dosyasına kaydet / yükle
+    // Ayarları yuzidpi.ini dosyasına kaydet / yükle
     void LoadConfig(const std::wstring& iniPath, bool& outAutoConnect, bool& outAutoLaunchApps, bool& outStartMinimized);
     void SaveConfig(const std::wstring& iniPath, bool autoConnect, bool autoLaunchApps, bool startMinimized);
 
@@ -163,7 +158,6 @@ private:
     bool IsTargetInBypassList(const std::string& host) const;
     bool ResolveBypassDecisionFast(SOCKET clientSock, const std::string& host, std::wstring& outClientExe, std::wstring& outReason) const;
     bool ShouldBypassConnection(const std::string& host, const std::wstring& clientFullPath, const std::wstring& clientExeName, std::wstring& outReason) const;
-    bool LaunchSingleExeTunneled(const std::wstring& exePath);
 
     void RegisterRelaySocket(SOCKET s);
     void UnregisterRelaySocket(SOCKET s);
