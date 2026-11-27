@@ -5,14 +5,68 @@
 #include <vector>
 #include <cstdio>
 
-#define YUZIDPI_VERSION_STR  "1.0.8"
-#define YUZIDPI_VERSION_WSTR L"v1.0.8"
+#define YUZIDPI_VERSION_STR  "1.0.9"
+#define YUZIDPI_VERSION_WSTR L"v1.0.9"
 #define WM_OTA_RESTART       (WM_USER + 150)
 
 static inline std::wstring GetCurrentExeFullPath() {
     wchar_t buf[MAX_PATH] = {0};
     GetModuleFileNameW(NULL, buf, MAX_PATH);
     return std::wstring(buf);
+}
+
+static inline bool MoveFileWithRetry(const std::wstring& src, const std::wstring& dst, int maxAttempts = 12, DWORD delayMs = 150) {
+    for (int i = 0; i < maxAttempts; ++i) {
+        if (MoveFileExW(src.c_str(), dst.c_str(), MOVEFILE_REPLACE_EXISTING)) {
+            return true;
+        }
+        Sleep(delayMs);
+    }
+    return false;
+}
+
+static inline bool VerifyDownloadedPeBinary(const std::wstring& filePath) {
+    // Antivirüs gerçek zamanlı taramasının yeni yazılan dosyayı incelemesi için bekle;
+    // dosya karantinaya alındıysa veya kilitli/bozuksa asıl YuziDPI.exe'ye hiç dokunma!
+    Sleep(1500);
+
+    HANDLE hFile = INVALID_HANDLE_VALUE;
+    for (int i = 0; i < 12; ++i) {
+        hFile = CreateFileW(filePath.c_str(), GENERIC_READ, 0, NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+        if (hFile != INVALID_HANDLE_VALUE) break;
+        DWORD err = GetLastError();
+        if (err == ERROR_FILE_NOT_FOUND || err == ERROR_PATH_NOT_FOUND || err == 225 /* ERROR_VIRUS_INFECTED */) {
+            return false;
+        }
+        Sleep(200);
+    }
+    if (hFile == INVALID_HANDLE_VALUE) return false;
+
+    LARGE_INTEGER fileSize{};
+    bool valid = false;
+    if (GetFileSizeEx(hFile, &fileSize) && fileSize.QuadPart > 100 * 1024 && fileSize.QuadPart < 50 * 1024 * 1024) {
+        BYTE hdr[4096] = {0};
+        DWORD bytesRead = 0;
+        if (ReadFile(hFile, hdr, sizeof(hdr), &bytesRead, NULL) && bytesRead >= 64) {
+            if (hdr[0] == 'M' && hdr[1] == 'Z') {
+                DWORD peOff = *(DWORD*)(hdr + 0x3C);
+                if (peOff <= bytesRead - 4) {
+                    valid = (hdr[peOff] == 'P' && hdr[peOff + 1] == 'E' && hdr[peOff + 2] == 0 && hdr[peOff + 3] == 0);
+                } else if (peOff < (DWORD)fileSize.QuadPart - 4) {
+                    LARGE_INTEGER seekPos{};
+                    seekPos.QuadPart = peOff;
+                    BYTE peSig[4] = {0};
+                    DWORD sigRead = 0;
+                    if (SetFilePointerEx(hFile, seekPos, NULL, FILE_BEGIN) &&
+                        ReadFile(hFile, peSig, 4, &sigRead, NULL) && sigRead == 4) {
+                        valid = (peSig[0] == 'P' && peSig[1] == 'E' && peSig[2] == 0 && peSig[3] == 0);
+                    }
+                }
+            }
+        }
+    }
+    CloseHandle(hFile);
+    return valid;
 }
 
 static inline void CleanupOldOtaFiles() {
@@ -242,16 +296,30 @@ static inline DWORD WINAPI SilentOtaWorkerThreadProc(LPVOID param) {
         return 0;
     }
 
-    // Çalışan exe'yi .old olarak yeniden adlandır ve yeni indirilen .update dosyasını asıl exe yerine taşı
-    DeleteFileW(oldPath.c_str());
-    if (!MoveFileExW(exePath.c_str(), oldPath.c_str(), MOVEFILE_REPLACE_EXISTING)) {
+    // Antivirüs taramasından sağlam çıkıp tam PE başlığı doğrulanmadan asıl .exe'ye DOKUNMA!
+    if (!VerifyDownloadedPeBinary(updPath)) {
         DeleteFileW(updPath.c_str());
         return 0;
     }
 
-    if (!MoveFileExW(updPath.c_str(), exePath.c_str(), MOVEFILE_REPLACE_EXISTING)) {
-        // Geri al
-        MoveFileExW(oldPath.c_str(), exePath.c_str(), MOVEFILE_REPLACE_EXISTING);
+    // Çalışan exe'yi .old olarak yedekle ve yeni indirilen .update dosyasını asıl exe yerine taşı
+    DeleteFileW(oldPath.c_str());
+    if (!MoveFileWithRetry(exePath, oldPath, 10, 150)) {
+        DeleteFileW(updPath.c_str());
+        return 0;
+    }
+
+    if (!MoveFileWithRetry(updPath, exePath, 12, 150)) {
+        // Kesin geri alma (rollback) — asıl exe asla kaybolmaz
+        MoveFileWithRetry(oldPath, exePath, 20, 150);
+        DeleteFileW(updPath.c_str());
+        return 0;
+    }
+
+    // İsim değişikliği sonrası antivirüs anlık karantina kontrolü
+    Sleep(300);
+    if (GetFileAttributesW(exePath.c_str()) == INVALID_FILE_ATTRIBUTES) {
+        MoveFileWithRetry(oldPath, exePath, 20, 150);
         return 0;
     }
 

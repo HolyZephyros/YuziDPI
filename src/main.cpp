@@ -1040,7 +1040,6 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
         case WM_CREATE: {
             g_hMainWnd = hwnd;
             CoInitializeEx(NULL, COINIT_APARTMENTTHREADED);
-            CleanupOldOtaFiles();
 
             BOOL useDarkMode = TRUE;
             DwmSetWindowAttribute(hwnd, 20 /* DWMWA_USE_IMMERSIVE_DARK_MODE */, &useDarkMode, sizeof(useDarkMode));
@@ -1223,36 +1222,63 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
         case WM_TIMER: {
             if (wParam == 1) {
                 KillTimer(hwnd, 1);
+                CleanupOldOtaFiles();
                 UpdateStatusUi();
             }
             return 0;
         }
 
         case WM_OTA_RESTART: {
-            bool wasHidden = !IsWindowVisible(hwnd);
-            g_engine.SetCallbacks(nullptr, nullptr);
-            g_engine.Stop();
-            g_engine.EnableSystemSmartPac(false);
-            if (g_nid.hWnd) {
-                Shell_NotifyIconW(NIM_DELETE, &g_nid);
-                g_nid.hWnd = NULL;
-            }
-            ShowWindow(hwnd, SW_HIDE);
+            bool wasHidden  = !IsWindowVisible(hwnd);
+            bool wasRunning = g_engine.IsRunning();
             std::wstring exePath = GetCurrentExeFullPath();
-            wchar_t cmdLine[MAX_PATH + 32] = {0};
-            if (wasHidden) {
-                _snwprintf_s(cmdLine, _countof(cmdLine), _TRUNCATE, L"\"%s\" --minimized", exePath.c_str());
+            std::wstring oldPath = exePath + L".old";
+
+            if (wasRunning) {
+                g_engine.Stop();
+            }
+
+            bool launchedHealthy = false;
+            if (GetFileAttributesW(exePath.c_str()) != INVALID_FILE_ATTRIBUTES) {
+                wchar_t cmdLine[MAX_PATH + 32] = {0};
+                if (wasHidden) {
+                    _snwprintf_s(cmdLine, _countof(cmdLine), _TRUNCATE, L"\"%s\" --minimized", exePath.c_str());
+                } else {
+                    _snwprintf_s(cmdLine, _countof(cmdLine), _TRUNCATE, L"\"%s\"", exePath.c_str());
+                }
+                STARTUPINFOW si{};
+                si.cb = sizeof(si);
+                PROCESS_INFORMATION pi{};
+                if (CreateProcessW(NULL, cmdLine, NULL, NULL, FALSE, 0, NULL, NULL, &si, &pi)) {
+                    // Yeni sürecin anında antivirüs/hata tarafından kapatılmadığını doğrula (400 ms)
+                    DWORD waitRes = WaitForSingleObject(pi.hProcess, 400);
+                    if (waitRes == WAIT_TIMEOUT) {
+                        launchedHealthy = true;
+                    }
+                    CloseHandle(pi.hThread);
+                    CloseHandle(pi.hProcess);
+                }
+            }
+
+            if (launchedHealthy) {
+                g_engine.SetCallbacks(nullptr, nullptr);
+                if (g_nid.hWnd) {
+                    Shell_NotifyIconW(NIM_DELETE, &g_nid);
+                    g_nid.hWnd = NULL;
+                }
+                ShowWindow(hwnd, SW_HIDE);
+                DestroyWindow(hwnd);
             } else {
-                _snwprintf_s(cmdLine, _countof(cmdLine), _TRUNCATE, L"\"%s\"", exePath.c_str());
+                // Yeni sürüm başlatılamadıysa (ör. antivirüs karantinası) eski .old yedeğini geri kurtar ve çalışmaya devam et!
+                DeleteFileW(exePath.c_str());
+                if (GetFileAttributesW(oldPath.c_str()) != INVALID_FILE_ATTRIBUTES) {
+                    MoveFileWithRetry(oldPath, exePath, 20, 150);
+                }
+                if (wasRunning) {
+                    g_engine.Start(3131, 1080);
+                    UpdateStatusUi();
+                }
             }
-            STARTUPINFOW si{};
-            si.cb = sizeof(si);
-            PROCESS_INFORMATION pi{};
-            if (CreateProcessW(NULL, cmdLine, NULL, NULL, FALSE, 0, NULL, NULL, &si, &pi)) {
-                CloseHandle(pi.hThread);
-                CloseHandle(pi.hProcess);
-            }
-            DestroyWindow(hwnd);
             return 0;
         }
 
@@ -1461,16 +1487,16 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, LPWSTR lpCmdLine, int) {
     }
 
     // Eğer az önce OTA güncellemesiyle yeniden başlatıldıysa (.old dosyası varsa),
-    // eski sürecin penceresini kapatmasını bekle ki tek-örnek (FindWindow) kontrolüne takılmasın
+    // eski sürecin penceresini kapatmasını bekle ki tek-örnek (FindWindow) kontrolüne takılmasın.
+    // (.old dosyası ancak yeni pencere 800ms sağlıklı çalıştıktan sonra WM_TIMER içinde silinir.)
     {
         std::wstring oldFile = GetCurrentExeFullPath() + L".old";
         if (GetFileAttributesW(oldFile.c_str()) != INVALID_FILE_ATTRIBUTES) {
-            for (int i = 0; i < 40; ++i) {
+            for (int i = 0; i < 60; ++i) {
                 if (!FindWindowW(L"YuziDpiDarkLiquidGlassWnd", NULL)) break;
                 Sleep(50);
             }
             Sleep(100);
-            DeleteFileW(oldFile.c_str());
         }
     }
 
