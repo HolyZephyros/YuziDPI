@@ -156,6 +156,8 @@ private:
 
     bool IsUserExcludedHost(const std::string& host) const;
     bool IsTargetInBypassList(const std::string& host) const;
+    bool IsDiscordTargeted() const;
+    void RescueStuckStartupDiscord();
     bool ResolveBypassDecisionFast(SOCKET clientSock, const std::string& host, std::wstring& outClientExe, std::wstring& outReason) const;
     bool ShouldBypassConnection(const std::string& host, const std::wstring& clientFullPath, const std::wstring& clientExeName, std::wstring& outReason) const;
 
@@ -166,6 +168,8 @@ private:
 private:
     std::atomic<bool> m_running{false};
     std::atomic<bool> m_discovering{false};
+    std::atomic<bool> m_didStartupRescue{false};
+    std::atomic<bool> m_lastProbeOk{false};
     std::atomic<bool> m_useSystemPac{true};
     std::atomic<bool> m_autoLaunchApps{true};
     std::atomic<int>  m_scopeMode{SCOPE_ONLY_LISTED};

@@ -1,4 +1,6 @@
 #include "dpi_engine.h"
+#include <tlhelp32.h>
+#include <shellapi.h>
 #include <stdarg.h>
 #include <algorithm>
 #include <cstring>
@@ -1178,7 +1180,8 @@ BypassStage ZeroDpiEngine::RunAutoDiscovery(int& outLatencyMs) {
     ResolveDoH("discord.com", fixed);
 
     int lat = 0;
-    ProbeDomainAtStage("discord.com", 443, fixed, lat);
+    bool probed = ProbeDomainAtStage("discord.com", 443, fixed, lat);
+    m_lastProbeOk.store(probed);
     if (lat <= 0) lat = 15;
 
     m_lastLatencyMs.store(lat);
@@ -1666,17 +1669,311 @@ DWORD WINAPI ZeroDpiEngine::SocksAcceptThreadProc(LPVOID param) {
     return 0;
 }
 
+static bool ContainsWideCaseInsensitive(const std::wstring& hay, const std::wstring& needle) {
+    if (needle.empty() || hay.size() < needle.size()) return false;
+    for (size_t i = 0; i + needle.size() <= hay.size(); ++i) {
+        bool match = true;
+        for (size_t j = 0; j < needle.size(); ++j) {
+            if (towlower(hay[i + j]) != towlower(needle[j])) {
+                match = false;
+                break;
+            }
+        }
+        if (match) return true;
+    }
+    return false;
+}
+
+static bool ParseAppVersionDir(const wchar_t* name, int& v1, int& v2, int& v3) {
+    if (_wcsnicmp(name, L"app-", 4) != 0) return false;
+    v1 = v2 = v3 = 0;
+    return (swscanf(name + 4, L"%d.%d.%d", &v1, &v2, &v3) >= 2);
+}
+
+static std::wstring FindLatestSquirrelAppExe(const std::wstring& baseFolder, const wchar_t* exeName) {
+    if (baseFolder.empty()) return L"";
+    std::wstring pattern = baseFolder + L"\\app-*";
+    WIN32_FIND_DATAW fd{};
+    HANDLE hFind = FindFirstFileW(pattern.c_str(), &fd);
+    if (hFind == INVALID_HANDLE_VALUE) return L"";
+
+    std::wstring bestPath;
+    int best1 = -1, best2 = -1, best3 = -1;
+    do {
+        if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) {
+            int v1 = 0, v2 = 0, v3 = 0;
+            if (ParseAppVersionDir(fd.cFileName, v1, v2, v3)) {
+                std::wstring cand = baseFolder + L"\\" + fd.cFileName + L"\\" + exeName;
+                if (GetFileAttributesW(cand.c_str()) != INVALID_FILE_ATTRIBUTES) {
+                    bool newer = (v1 > best1) ||
+                                 (v1 == best1 && v2 > best2) ||
+                                 (v1 == best1 && v2 == best2 && v3 > best3);
+                    if (newer) {
+                        best1 = v1; best2 = v2; best3 = v3;
+                        bestPath = cand;
+                    }
+                }
+            }
+        }
+    } while (FindNextFileW(hFind, &fd));
+    FindClose(hFind);
+    return bestPath;
+}
+
+static void CollectDiscordPids(std::vector<DWORD>& outPids, std::wstring& outBaseDir) {
+    outPids.clear();
+    outBaseDir.clear();
+
+    HANDLE hSnap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+    if (hSnap == INVALID_HANDLE_VALUE) return;
+
+    PROCESSENTRY32W pe{};
+    pe.dwSize = sizeof(pe);
+    if (Process32FirstW(hSnap, &pe)) {
+        do {
+            bool isUpdater = (_wcsicmp(pe.szExeFile, L"Update.exe") == 0);
+            bool isDiscord = (_wcsicmp(pe.szExeFile, L"Discord.exe") == 0);
+            if (!isUpdater && !isDiscord) continue;
+
+            HANDLE hProc = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pe.th32ProcessID);
+            if (!hProc) continue;
+
+            wchar_t fullPath[MAX_PATH] = {0};
+            DWORD sz = MAX_PATH;
+            if (QueryFullProcessImageNameW(hProc, 0, fullPath, &sz) && sz > 0) {
+                std::wstring pathStr(fullPath, sz);
+                if (ContainsWideCaseInsensitive(pathStr, L"\\Discord\\")) {
+                    outPids.push_back(pe.th32ProcessID);
+                    if (outBaseDir.empty()) {
+                        std::wstring lower = pathStr;
+                        for (auto& ch : lower) ch = towlower(ch);
+                        size_t pos = lower.find(L"\\discord\\");
+                        if (pos != std::wstring::npos) {
+                            outBaseDir = pathStr.substr(0, pos + 8); // ...\Discord
+                        }
+                    }
+                }
+            }
+            CloseHandle(hProc);
+        } while (Process32NextW(hSnap, &pe));
+    }
+    CloseHandle(hSnap);
+}
+
+static bool HasActiveTcpForPids(const std::vector<DWORD>& pids, uint16_t httpPort) {
+    if (pids.empty()) return false;
+    const uint16_t netProxyPort = htons(httpPort);
+    const uint16_t netHttpsPort = htons(443);
+    const DWORD loopbackIp = htonl(INADDR_LOOPBACK);
+
+    auto pidMatches = [&](DWORD pid) -> bool {
+        return std::find(pids.begin(), pids.end(), pid) != pids.end();
+    };
+
+    DWORD sz4 = 0;
+    if (GetExtendedTcpTable(nullptr, &sz4, FALSE, AF_INET, TCP_TABLE_OWNER_PID_ALL, 0) == ERROR_INSUFFICIENT_BUFFER && sz4 > 0) {
+        std::vector<uint8_t> buf(sz4);
+        if (GetExtendedTcpTable(buf.data(), &sz4, FALSE, AF_INET, TCP_TABLE_OWNER_PID_ALL, 0) == NO_ERROR) {
+            const auto* tbl = (const MIB_TCPTABLE_OWNER_PID*)buf.data();
+            for (DWORD i = 0; i < tbl->dwNumEntries; ++i) {
+                const auto& r = tbl->table[i];
+                if (r.dwState != MIB_TCP_STATE_ESTAB) continue;
+                if (!pidMatches(r.dwOwningPid)) continue;
+                uint16_t rPort = (uint16_t)(r.dwRemotePort & 0xFFFF);
+                if ((r.dwRemoteAddr == loopbackIp && rPort == netProxyPort) || rPort == netHttpsPort) {
+                    return true;
+                }
+            }
+        }
+    }
+
+    DWORD sz6 = 0;
+    if (GetExtendedTcpTable(nullptr, &sz6, FALSE, AF_INET6, TCP_TABLE_OWNER_PID_ALL, 0) == ERROR_INSUFFICIENT_BUFFER && sz6 > 0) {
+        std::vector<uint8_t> buf6(sz6);
+        if (GetExtendedTcpTable(buf6.data(), &sz6, FALSE, AF_INET6, TCP_TABLE_OWNER_PID_ALL, 0) == NO_ERROR) {
+            const auto* tbl6 = (const MIB_TCP6TABLE_OWNER_PID*)buf6.data();
+            for (DWORD i = 0; i < tbl6->dwNumEntries; ++i) {
+                const auto& r = tbl6->table[i];
+                if (r.dwState != MIB_TCP_STATE_ESTAB) continue;
+                if (!pidMatches(r.dwOwningPid)) continue;
+                uint16_t rPort = (uint16_t)(r.dwRemotePort & 0xFFFF);
+                if (rPort == netHttpsPort || rPort == netProxyPort) {
+                    return true;
+                }
+            }
+        }
+    }
+    return false;
+}
+
+struct VisibleWinCheckCtx {
+    const std::vector<DWORD>* pids;
+    bool foundVisible;
+};
+
+static BOOL CALLBACK EnumVisibleDiscordWinProc(HWND hwnd, LPARAM lParam) {
+    auto* ctx = (VisibleWinCheckCtx*)lParam;
+    if (!IsWindowVisible(hwnd)) return TRUE;
+    DWORD pid = 0;
+    GetWindowThreadProcessId(hwnd, &pid);
+    if (std::find(ctx->pids->begin(), ctx->pids->end(), pid) != ctx->pids->end()) {
+        RECT rc{};
+        if (GetWindowRect(hwnd, &rc) && (rc.right - rc.left) > 50 && (rc.bottom - rc.top) > 50) {
+            ctx->foundVisible = true;
+            return FALSE;
+        }
+    }
+    return TRUE;
+}
+
+static bool HasVisibleWindowForPids(const std::vector<DWORD>& pids) {
+    VisibleWinCheckCtx ctx{ &pids, false };
+    EnumWindows(EnumVisibleDiscordWinProc, (LPARAM)&ctx);
+    return ctx.foundVisible;
+}
+
+static bool DiscordAutostartUsesMinimized() {
+    HKEY hKey = NULL;
+    if (RegOpenKeyExW(HKEY_CURRENT_USER, L"Software\\Microsoft\\Windows\\CurrentVersion\\Run", 0, KEY_READ, &hKey) != ERROR_SUCCESS) {
+        return false;
+    }
+    wchar_t val[512] = {0};
+    DWORD sz = sizeof(val);
+    bool isMin = false;
+    if (RegQueryValueExW(hKey, L"Discord", NULL, NULL, (LPBYTE)val, &sz) == ERROR_SUCCESS) {
+        isMin = ContainsWideCaseInsensitive(val, L"--start-minimized");
+    }
+    RegCloseKey(hKey);
+    return isMin;
+}
+
+bool ZeroDpiEngine::IsDiscordTargeted() const {
+    int scope = m_scopeMode.load();
+    if (scope == SCOPE_FULL_SYSTEM) return true;
+
+    std::lock_guard<std::mutex> lock(m_mutex);
+    if (scope == SCOPE_ALL_EXCEPT_EXCLUDED) {
+        for (const auto& item : m_tunnelItems) {
+            if (!item.enabled || !item.isExcluded) continue;
+            if (ContainsWideCaseInsensitive(item.pathOrDomain, L"discord")) return false;
+        }
+        return true;
+    }
+
+    for (const auto& item : m_tunnelItems) {
+        if (!item.enabled || item.isExcluded) continue;
+        if (ContainsWideCaseInsensitive(item.pathOrDomain, L"discord")) return true;
+    }
+    return false;
+}
+
+void ZeroDpiEngine::RescueStuckStartupDiscord() {
+    if (!m_running.load() || !IsDiscordTargeted()) return;
+
+    std::vector<DWORD> pids;
+    std::wstring baseDir;
+    CollectDiscordPids(pids, baseDir);
+    if (pids.empty()) return;
+
+    // Wi-Fi açılış gecikmesi varsa ağ hazır olmadan Discord'a dokunma
+    if (!m_lastProbeOk.load()) {
+        BypassStage st = (BypassStage)m_activeStage.load();
+        for (int attempt = 0; attempt < 2 && m_running.load(); ++attempt) {
+            for (int w = 0; w < 20 && m_running.load(); ++w) Sleep(100);
+            if (!m_running.load()) return;
+            int lat = 0;
+            if (ProbeDomainAtStage("discord.com", 443, st, lat)) {
+                m_lastProbeOk.store(true);
+                break;
+            }
+        }
+        if (!m_lastProbeOk.load()) return;
+    }
+
+    if (HasActiveTcpForPids(pids, m_httpPort)) return;
+
+    // İlk kontrolde aktif bağlantı yoksa 1.5sn bekle ve yeniden doğrula (açık Discord'un yeniden bağlanma anına denk gelmemek için)
+    for (int i = 0; i < 15 && m_running.load(); ++i) Sleep(100);
+    if (!m_running.load()) return;
+
+    CollectDiscordPids(pids, baseDir);
+    if (pids.empty()) return;
+    if (HasActiveTcpForPids(pids, m_httpPort)) return;
+
+    if (baseDir.empty()) {
+        wchar_t localAppData[MAX_PATH] = {0};
+        if (GetEnvironmentVariableW(L"LOCALAPPDATA", localAppData, MAX_PATH) > 0) {
+            baseDir = std::wstring(localAppData) + L"\\Discord";
+        }
+    }
+    std::wstring discordExe = FindLatestSquirrelAppExe(baseDir, L"Discord.exe");
+    if (discordExe.empty()) return;
+
+    bool passStartMinimized = (!HasVisibleWindowForPids(pids) && DiscordAutostartUsesMinimized());
+
+    std::vector<HANDLE> termHandles;
+    for (DWORD pid : pids) {
+        HANDLE hProc = OpenProcess(PROCESS_TERMINATE | PROCESS_QUERY_LIMITED_INFORMATION | SYNCHRONIZE, FALSE, pid);
+        if (!hProc) continue;
+        wchar_t fullPath[MAX_PATH] = {0};
+        DWORD sz = MAX_PATH;
+        if (QueryFullProcessImageNameW(hProc, 0, fullPath, &sz) &&
+            ContainsWideCaseInsensitive(std::wstring(fullPath, sz), L"\\Discord\\")) {
+            TerminateProcess(hProc, 0);
+            termHandles.push_back(hProc);
+        } else {
+            CloseHandle(hProc);
+        }
+    }
+    if (!termHandles.empty()) {
+        DWORD count = (DWORD)((termHandles.size() > MAXIMUM_WAIT_OBJECTS) ? MAXIMUM_WAIT_OBJECTS : termHandles.size());
+        WaitForMultipleObjects(count, termHandles.data(), TRUE, 800);
+        for (HANDLE h : termHandles) CloseHandle(h);
+        Sleep(150);
+    }
+
+    if (!m_running.load()) return;
+
+    // Discord'un Rust güncelleyicisi (reqwest) Windows Registry proxy'sini sorunsuz okusun diye env proxy temizle
+    SetEnvironmentVariableW(L"HTTP_PROXY", NULL);
+    SetEnvironmentVariableW(L"HTTPS_PROXY", NULL);
+    SetEnvironmentVariableW(L"ALL_PROXY", NULL);
+    SetEnvironmentVariableW(L"http_proxy", NULL);
+    SetEnvironmentVariableW(L"https_proxy", NULL);
+    SetEnvironmentVariableW(L"all_proxy", NULL);
+
+    std::wstring workDir = discordExe;
+    size_t slash = workDir.find_last_of(L"\\/");
+    if (slash != std::wstring::npos) workDir.resize(slash);
+
+    wchar_t params[512] = {0};
+    if (passStartMinimized) {
+        _snwprintf_s(params, _countof(params), _TRUNCATE,
+            L"--proxy-server=\"http://127.0.0.1:%u\" --enable-features=EncryptedClientHello --start-minimized",
+            m_httpPort);
+    } else {
+        _snwprintf_s(params, _countof(params), _TRUNCATE,
+            L"--proxy-server=\"http://127.0.0.1:%u\" --enable-features=EncryptedClientHello",
+            m_httpPort);
+    }
+
+    ShellExecuteW(NULL, L"open", discordExe.c_str(), params, workDir.c_str(), SW_SHOWNORMAL);
+    Log(L"[↻] Başlangıçta takılı kalan Discord otomatik kurtarıldı.");
+}
+
 DWORD WINAPI ZeroDpiEngine::StartupWorkerThreadProc(LPVOID param) {
     ZeroDpiEngine* self = (ZeroDpiEngine*)param;
     if (!self->m_running.load()) {
         self->m_activeWorkers.fetch_sub(1);
         return 0;
     }
-    self->EnableSystemSmartPac(true);
     int lat = 0;
     BypassStage st = (BypassStage)self->m_selectedMode.load();
     if (self->m_running.load()) {
         st = self->RunAutoDiscovery(lat);
+        if (self->m_running.load() && !self->m_didStartupRescue.exchange(true)) {
+            self->RescueStuckStartupDiscord();
+        }
     } else {
         self->EnableSystemSmartPac(false);
     }

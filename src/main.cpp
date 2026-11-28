@@ -129,6 +129,9 @@ static int  g_sbDragGrabY   = 0;
 static ZeroDpiEngine g_engine;
 static NOTIFYICONDATAW g_nid{};
 static std::wstring g_iniPath;
+static bool g_preloadedConfig = false;
+static bool g_bootAutoConn    = false;
+static bool g_bootStartMin    = false;
 static UINT g_uMsgTaskbarCreated = 0;
 
 static LONG WINAPI YuziCrashSafeFilter(EXCEPTION_POINTERS*) {
@@ -1044,14 +1047,18 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
             COLORREF captionCol = CTP_MANTLE;
             DwmSetWindowAttribute(hwnd, 35 /* DWMWA_CAPTION_COLOR */, &captionCol, sizeof(captionCol));
 
-            g_iniPath = GetConfigIniPath();
+            if (g_iniPath.empty()) {
+                g_iniPath = GetConfigIniPath();
+            }
 
-            bool autoConn = false;
+            bool autoConn = g_bootAutoConn;
             bool autoLaunch = true;
-            bool startMin = false;
-            g_engine.LoadConfig(g_iniPath, autoConn, autoLaunch, startMin);
-            g_engine.SetUseSystemPac(true);
-            g_engine.SetAutoLaunchApps(true);
+            bool startMin = g_bootStartMin;
+            if (!g_preloadedConfig) {
+                g_engine.LoadConfig(g_iniPath, autoConn, autoLaunch, startMin);
+                g_engine.SetUseSystemPac(true);
+                g_engine.SetAutoLaunchApps(true);
+            }
 
             wchar_t langBuf[16] = {0};
             GetPrivateProfileStringW(L"Settings", L"Language", L"", langBuf, _countof(langBuf), g_iniPath.c_str());
@@ -1066,7 +1073,10 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
             g_engine.SetCallbacks(OnEngineLog, OnEngineState);
 
             if (autoConn) {
-                ToggleStartStop();
+                if (!g_engine.IsRunning()) {
+                    g_engine.Start(3131, 1080);
+                }
+                UpdateStatusUi();
             } else {
                 g_engine.EnableSystemSmartPac(false);
             }
@@ -1499,6 +1509,19 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, LPWSTR lpCmdLine, int) {
             PostMessageW(hExisting, WM_COMMAND, ID_TRAY_OPEN, 0);
         }
         return 0;
+    }
+
+    // Açılış hızlandırması: Oto Bağlan aktifse UI/GDI+ kurulmadan önce (~10ms içinde) yerel tüneli başlat
+    {
+        g_iniPath = GetConfigIniPath();
+        bool autoLaunch = true;
+        g_engine.LoadConfig(g_iniPath, g_bootAutoConn, autoLaunch, g_bootStartMin);
+        g_engine.SetUseSystemPac(true);
+        g_engine.SetAutoLaunchApps(true);
+        g_preloadedConfig = true;
+        if (g_bootAutoConn) {
+            g_engine.Start(3131, 1080);
+        }
     }
 
     GdiplusStartupInput gdiplusStartupInput;
